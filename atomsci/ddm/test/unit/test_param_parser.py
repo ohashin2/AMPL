@@ -12,6 +12,8 @@ currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentfram
 parentdir = os.path.dirname(currentdir)
 import atomsci.ddm.pipeline.parameter_parser as parse
 
+import pdb
+
 config_path = currentdir + '/config_list_inputs.json'
 filter_dict_path = currentdir + '/filter_dict_example.json'
 required_inputs = ['--dataset_key','/ds/data/public/delaney/delaney-processed.csv',
@@ -117,9 +119,7 @@ hierarchical_input_dict = {
 command_line_namespace_inputs = [str(list_inputs_namespace)]
 command_line_dict_inputs = [str(list_inputs_dict)]
 
-'''
-
-# The file metadata_test.json is an example config file from the model zoo. 
+"""# The file metadata_test.json is an example config file from the model zoo.
 def test_model_metadata_input_as_dict():
     with open(currentdir + '/metadata_test.json') as f:
         config = json.loads(f.read())
@@ -131,7 +131,7 @@ def test_model_metadata_input_as_dict():
     test.append(params.max_epochs == 3
     test.append(params.layer_sizes == [1000,500]
     test.append(params.result_dir == '/usr/local/data/delaney_refactored2'
-'''
+"""
 
 def test_default_params_json():
     params = parse.wrapper(currentdir + '/config_required_inputs.json')
@@ -144,14 +144,16 @@ def test_default_params_json():
     
 def test_dupe_params_json(caplog):
     params = parse.wrapper(currentdir + '/config_dupe_inputs.json')
-    assert caplog.records[0].levelname == 'WARNING'
+    for record in caplog.records:
+        assert record.levelname == 'WARNING'
     
 def test_incorrect_params_json(caplog):
 
    # with pytest.raises(ValueError):
     #with pytest.log(UserWarning):
     params = parse.wrapper(currentdir + '/config_wrong_inputs.json')
-    assert caplog.records[0].levelname == 'WARNING'
+    for record in caplog.records:
+        assert record.levelname == 'WARNING'
         
 
 def test_correct_input_mixed_command_line_types():
@@ -159,7 +161,7 @@ def test_correct_input_mixed_command_line_types():
     test = []
     test.append(params.system == 'twintron-blue')
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe') 
@@ -175,7 +177,7 @@ def test_correct_input_type_json():
     test = []
     test.append(params.system == 'twintron-blue')
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')
@@ -198,6 +200,12 @@ def test_default_params_command():
     params = parse.wrapper(required_inputs)
     defaults = default_parameters()
     assert params == defaults
+    
+
+def test_default_params_command_with_dataset_hash():
+    params = parse.wrapper(currentdir + '/../test_datasets/H1_hybrid.json')
+    # a valid dataset hash should be generated after the parse.wrapper call
+    assert params.dataset_hash != ''
 
 """
 #test for ensuring system exits on required command
@@ -260,9 +268,11 @@ def test_required_vals_namespace(caplog):
 
 def test_undefined_param_namespace(caplog):
     params = parse.wrapper(undefined_inputs_namespace)
-    assert caplog.records[0].levelname == 'WARNING'
+    for record in caplog.records:
+        assert record.levelname == 'WARNING'
     params = parse.wrapper(undefined_inputs_dict)
-    assert caplog.records[0].levelname == 'WARNING'
+    for record in caplog.records:
+        assert record.levelname == 'WARNING'
 
     
 def test_correct_input_type_namespace():
@@ -270,7 +280,7 @@ def test_correct_input_type_namespace():
     params = parse.wrapper(list_inputs_namespace)
     test = []
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')
@@ -293,7 +303,7 @@ def test_correct_input_type_namespace():
     
     params = parse.wrapper(list_inputs_dict)
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')
@@ -319,7 +329,7 @@ def test_command_line_namespace_and_dict_input():
     params = parse.wrapper(command_line_namespace_inputs)
     test = []
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')
@@ -338,7 +348,7 @@ def test_command_line_namespace_and_dict_input():
  'ModelMetadata.TrainingDataset.id_col': "['nin', [0,1,3,4]]"})
     params = parse.wrapper(command_line_dict_inputs)
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')
@@ -362,7 +372,7 @@ def test_hierarchical_dict():
     test = []
     test.append(params.system == 'twintron-blue')
     test.append(params.dataset_key == '/ds/data/public/delaney/delaney-processed.csv')
-    test.append(params.layer_sizes == [42,42])
+    test.append(params.layer_sizes == [[42, 42]])
     test.append(params.batch_size == 63)
     test.append(params.previously_split)
     test.append(params.descriptor_type == 'moe')

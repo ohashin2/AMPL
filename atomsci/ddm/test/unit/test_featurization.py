@@ -5,6 +5,8 @@ import inspect
 import numpy as np
 import atomsci.ddm.pipeline.featurization as feat
 import deepchem as dc
+from atomsci.ddm.pipeline import model_datasets as md
+
 try:
     from mol_vae_features import MoleculeVAEFeaturizer
     mol_vae_supported = True
@@ -21,11 +23,11 @@ datastore_is_down = utils.datastore_status()
 
 (delaney_params_ecfp, data_obj_ecfp, df_delaney) = utils.delaney_objects()
 featurizer_ecfp = data_obj_ecfp.featurization
-data_obj_ecfp.check_task_columns(df_delaney)
+md.check_task_columns(delaney_params_ecfp, df_delaney)
 
 (delaney_params_graphconv, data_obj_graphconv, df_delaney) = utils.delaney_objects(featurizer="graphconv")
 featurizer_graphconv = data_obj_graphconv.featurization
-data_obj_graphconv.check_task_columns(df_delaney)
+md.check_task_columns(delaney_params_graphconv, df_delaney)
 
 if mol_vae_supported:
     (delaney_params_molvae, data_obj_molvae, df_delaney) = utils.delaney_objects(featurizer="molvae")
@@ -66,7 +68,7 @@ def test_create_featurization_dynamicfeaturization():
     for method in methods:
         test.append(callable(getattr(featurizer_ecfp,method)))
         
-    test.append(isinstance(featurizer_ecfp.featurizer_obj, dc.feat.fingerprints.CircularFingerprint))
+    test.append(isinstance(featurizer_ecfp.featurizer_obj, dc.feat.CircularFingerprint))
     
     test.append(isinstance(featurizer_graphconv.featurizer_obj, dc.feat.graph_features.ConvMolFeaturizer))    
 
@@ -79,7 +81,7 @@ def test_create_featurization_dynamicfeaturization():
     
 #***********************************************************************************    
 def test_get_feature_columns_dynamicfeaturization():
-    """ Testing that dynamic featurization is pulling out the correct number of features and 'column names'. Also technically testing get_feature_count"""
+    """Testing that dynamic featurization is pulling out the correct number of features and 'column names'. Also technically testing get_feature_count"""
     test = []
     cols = featurizer_ecfp.get_feature_columns()
     test.append(len(cols) == delaney_params_ecfp.ecfp_size)
@@ -141,13 +143,13 @@ def test_get_feature_columns_dynamicfeaturization():
 
 #***********************************************************************************
 def test_get_featurized_dset_name_dynamicfeaturization():
-    """Dynamic featurization does not support get_featurized_dset_name """
+    """Dynamic featurization does not support get_featurized_dset_name"""
     with pytest.raises(Exception):
         featurizer_ecfp.get_featurized_dset_name(data_obj_ecfp.dataset_name)
 #***********************************************************************************
 
 def test_get_featurized_data_subdir_dynamicfeaturization():
-    """Dynamic featurization does not support get_featurized_data_subdir """
+    """Dynamic featurization does not support get_featurized_data_subdir"""
     with pytest.raises(Exception):
         featurizer_ecfp.get_featurized_data_subdir()
 #***********************************************************************************
@@ -155,7 +157,7 @@ def test_get_featurized_data_subdir_dynamicfeaturization():
 def test_get_feature_specific_metadata_dynamicfeaturization():
     """Dynamic featurization returns a dictionary of parameter settings of the featurization object that are specific to the feature type. Testing all three currently implemented featurizers (ecfp, graphconv, molvae)"""
     ecfp_metadata = featurizer_ecfp.get_feature_specific_metadata(delaney_params_ecfp)
-    assert ecfp_metadata =={'ECFPSpecific': 
+    assert ecfp_metadata =={'ecfp_specific':
                             {"ecfp_radius": delaney_params_ecfp.ecfp_radius,
                              "ecfp_size":delaney_params_ecfp.ecfp_size }}
     graphconv_metadata = featurizer_graphconv.get_feature_specific_metadata(delaney_params_graphconv)

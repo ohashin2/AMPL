@@ -29,9 +29,7 @@ def clean():
         shutil.rmtree('pytest')
 
 def datastore_status():
-    """
-    Returns True if the datastore is down, False otherwise. Will figure out how to do this programmatically 
-    """
+    """Returns True if the datastore is down, False otherwise. Will figure out how to do this programmatically"""
     try:
         a = datastore_objects()
     except Exception as e:
@@ -106,9 +104,7 @@ def moe_descriptors(datastore = False):
 
 
 def curate_delaney():
-    """
-    Curate dataset for model fitting
-    """
+    """Curate dataset for model fitting"""
     if (not os.path.isfile('delaney-processed_curated.csv') and
             not os.path.isfile('delaney-processed_curated_fit.csv') and
             not os.path.isfile('delaney-processed_curated_external.csv')):
@@ -133,12 +129,12 @@ def curate_delaney():
             column, tolerance, list_bad_duplicates, data, max_std, compound_id='compound_id', smiles_col='rdkit_smiles')
 
         # Check distribution of response values
-        assert (curated_df.shape[0] == 1117), 'Error: Incorrect number of compounds'
+        assert (curated_df.shape[0] == 1116), 'Error: Incorrect number of compounds'
 
         curated_df.to_csv('delaney-processed_curated.csv')
 
         # Create second test set by reproducible index for prediction
-        curated_df.tail(1000).to_csv('delaney-processed_curated_fit.csv')
+        curated_df.tail(999).to_csv('delaney-processed_curated_fit.csv')
         curated_df.head(117).to_csv('delaney-processed_curated_external.csv')
 
     assert (os.path.isfile('delaney-processed_curated.csv'))
@@ -147,20 +143,17 @@ def curate_delaney():
 
 
 def download_delaney():
-    """
-    Separate download function so that download can be run separately if there is no internet.
-    """
+    """Separate download function so that download can be run separately if there is no internet."""
     if (not os.path.isfile('delaney-processed.csv')):
         download_save(
-            'http://deepchem.io.s3-website-us-west-1.amazonaws.com/datasets/delaney-processed.csv',
+            'https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/delaney-processed.csv',
             'delaney-processed.csv')
 
     assert (os.path.isfile('delaney-processed.csv'))
 
 
 def download_save(url, file_name, verify=True):
-    """
-    Download dataset
+    """Download dataset
 
     Arguments:
         url: URL

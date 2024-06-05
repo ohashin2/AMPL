@@ -6,9 +6,7 @@ import shutil
 
 
 def clean_fit_predict():
-    """
-    Clean integrative test files
-    """
+    """Clean integrative test files"""
 
     split_files = glob.glob('./*_train_valid_test_*')
     for f in split_files:
@@ -22,8 +20,7 @@ def clean_fit_predict():
 
 
 def download_save(url, file_name, verify=True):
-    """
-    Download dataset
+    """Download dataset
 
     Arguments:
         url: URL
@@ -45,8 +42,7 @@ def download_save(url, file_name, verify=True):
 
 
 def get_subdirectory(model_dir_root):
-    """
-    Get model uuid from model directory with uuid subdirectory. Assumes that there is only one subdirectory.
+    """Get model uuid from model directory with uuid subdirectory. Assumes that there is only one subdirectory.
     model_dir_root: Model directory with uuid subdirectory
 
     Returns:
@@ -61,29 +57,42 @@ def get_subdirectory(model_dir_root):
     return uuid
 
 
-def training_statistics_file(model_dir, subset, minimum_r2):
-    """
-    Get training statistics
+def training_statistics_file(model_dir, subset, minimum_r2, metric_col='r2_score'):
+    """Get training statistics
 
     Arguments:
         model_dir: Model directory with training_model_metrics.json
         subset: Data subset
         minimum_r2: Minimum R^2
+        metric_col: Desired metric e.g. r2_score, accuracy_score
+    """
+
+    test_r2 = read_training_statistics_file(model_dir, subset, metric_col)
+    assert (test_r2 >= minimum_r2), 'Error: Model test R^2 %0.3f < minimum R^2 %0.3f'%(test_r2, minimum_r2)
+
+def read_training_statistics_file(model_dir, subset, metric_col):
+    """Get training statistics
+
+    Arguments:
+        model_dir: Model directory with training_model_metrics.json
+        subset: Data subset
+        metric_col: Desired metric e.g. r2_score, accuracy_score
     """
 
     # Open training JSON file
     assert (os.path.exists(model_dir)), 'Error: Result directory does not exist'
 
     # Open training model metrics file
-    training_model_metrics_file = model_dir+'/training_model_metrics.json'
+    training_model_metrics_file = model_dir+'/model_metrics.json'
     assert (os.path.exists(training_model_metrics_file)), 'Error: Model metadata file does not exist'
     with open(training_model_metrics_file) as f:
         training_model_metrics = json.loads(f.read())
 
     # Get best statistics
-    training_run = training_model_metrics['ModelMetrics']['TrainingRun']
-    for t in training_run:
-        if (t['subset'] == subset) and (t['label'] == 'best'):
+    for m in training_model_metrics:
+        if (m['subset'] == subset) and (m['label'] == 'best'):
             break
 
-    assert (t['PredictionResults']['r2_score'] >= minimum_r2), 'Error: Model test R^2 < minimum R^2'
+    test_metric = m['prediction_results'][metric_col]
+    return test_metric
+

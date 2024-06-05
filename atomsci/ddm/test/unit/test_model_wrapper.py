@@ -6,6 +6,7 @@ import numpy as np
 import atomsci.ddm.pipeline.featurization as feat
 import atomsci.ddm.pipeline.parameter_parser as parse
 import deepchem as dc
+from deepchem.models import GraphConvModel
 import atomsci.ddm.pipeline.model_datasets as model_dataset
 import atomsci.ddm.pipeline.model_wrapper as model_wrapper
 import atomsci.ddm.pipeline.model_pipeline as MP
@@ -13,6 +14,7 @@ import atomsci.ddm.pipeline.perf_data as perf_data
 
 import utils_testing as utils
 import copy
+import pdb
 
 """This testing script assumes that /ds/data/public/delaney/delaney-processed.csv is still on the same path on twintron. Assumes that the dataset_key: /ds/projdata/gsk_data/GSK_derived/PK_parameters/gsk_blood_plasma_partition_rat_crit_res_data.csv under the bucket gskdata and with the object_oid: 5af0e6368003ff018de33db5 still exists. 
 """
@@ -41,7 +43,7 @@ general_params = {'dataset_key' : './delaney-processed.csv',
 
 
 
-DD = dc.data.datasets.DiskDataset
+DD = dc.data.datasets.NumpyDataset
 
 #***********************************************************************************
 def test_create_model_wrapper():
@@ -61,12 +63,13 @@ Dependencies:
 None
 
 Calls:
-DCNNModelWrapper, DCRFModelWrapper
+MultitaskDCModelWrapper, DCRFModelWrapper
     """
     inp_params = parse.wrapper(general_params)
     featurization = feat.create_featurization(inp_params)
     mdl = model_wrapper.create_model_wrapper(inp_params, featurization)
     mdl.setup_model_dirs()
+    
     # testing for correct attribute initialization with model_type == "NN"
     test = []
     test.append(mdl.params.model_type == 'NN')
@@ -74,10 +77,9 @@ DCNNModelWrapper, DCRFModelWrapper
     test.append(mdl.output_dir == inp_params.output_dir)
     test.append(mdl.model_dir == inp_params.output_dir + '/' + 'model')
     test.append(mdl.best_model_dir == inp_params.output_dir + '/' + 'best_model')
-    test.append(mdl.baseline_model_dir == inp_params.output_dir + '/' + 'baseline_epoch_model')
     test.append(mdl.transformers == [])
     test.append(mdl.transformers_x == [])
-    test.append(isinstance(mdl, model_wrapper.DCNNModelWrapper))
+    test.append(isinstance(mdl, model_wrapper.MultitaskDCModelWrapper))
 
     # testing for correct attribute initialization with model_type == "RF"
     temp_params = copy.deepcopy(inp_params)
@@ -98,8 +100,7 @@ DCNNModelWrapper, DCRFModelWrapper
 
 #***********************************************************************************
 def test_super_create_transformers():
-    """
-    Args:
+    """Args:
     model_dataset: The ModelDataset object that handles the current dataset
 
     Returns:
@@ -118,7 +119,7 @@ def test_super_create_transformers():
     model_dataset.get_dataset_tasks
     model_dataset.check_task_columns
     model_dataset.get_featurized_data
-    Requires (self.params.prediction_type == 'regression' and self.params.transformers == True) or len(self.transformers) > 0 
+    Requires (self.params.prediction_type == 'regression' and self.params.transformers == True) or len(self.transformers) > 0
 
     Calls:
     self.featurization.create_feature_transformer
@@ -132,7 +133,7 @@ def test_super_create_transformers():
     data_obj_ecfp = model_dataset.create_model_dataset(inp_params, featurization, ds_client = None)
     df_delaney = data_obj_ecfp.load_full_dataset()
     data_obj_ecfp.get_dataset_tasks(df_delaney)
-    data_obj_ecfp.check_task_columns(df_delaney)
+    model_dataset.check_task_columns(inp_params, df_delaney)
     data_obj_ecfp.get_featurized_data()
     mdl = model_wrapper.create_model_wrapper(inp_params, data_obj_ecfp.featurization)
     mdl.setup_model_dirs()
@@ -160,8 +161,7 @@ def test_super_create_transformers():
 
 #***********************************************************************************
 def test_super_transform_dataset():
-    """
-    Args:
+    """Args:
     dataset: The DeepChem DiskDataset that contains a dataset
 
     Returns:
@@ -176,7 +176,6 @@ def test_super_transform_dataset():
     Calls:
     None
 
-
     """
     #set up for a model wrapper with regression and NN.
     inp_params = parse.wrapper(general_params)
@@ -184,7 +183,7 @@ def test_super_transform_dataset():
     data_obj_ecfp = model_dataset.create_model_dataset(inp_params, featurization, ds_client = None)
     df_delaney = data_obj_ecfp.load_full_dataset()
     data_obj_ecfp.get_dataset_tasks(df_delaney)
-    data_obj_ecfp.check_task_columns(df_delaney)
+    model_dataset.check_task_columns(inp_params, df_delaney)
     data_obj_ecfp.get_featurized_data()
     mdl = model_wrapper.create_model_wrapper(inp_params, data_obj_ecfp.featurization)
     mdl.setup_model_dirs()
@@ -282,11 +281,9 @@ def test_super_transform_dataset():
 
 #***********************************************************************************
 def test_train_NN_graphconv_scaffold_inputs():
-    """
-
-    Args:
+    """Args:
     pipeline (ModelPipeline): The ModelPipeline instance for this model run.
-    
+
     Dependencies:
     ModelPipeline creation
     featurization creation
@@ -311,21 +308,21 @@ def test_train_NN_graphconv_scaffold_inputs():
     mp.model_wrapper = model_wrapper.create_model_wrapper(inp_params, mp.featurization, mp.ds_client)
     # asserting that the correct model is created with the correct layer sizes, dropouts, model_dir, and mode by default
     test1 = []
+    
     test1.append(mp.model_wrapper.params.layer_sizes == [100, 100, 10])
     test1.append(mp.model_wrapper.params.dropouts == [0.3,0.3,0.1])
     # checking that parameters are properly passed to the deepchem model object
-    test1.append(isinstance(mp.model_wrapper.model, dc.models.tensorgraph.models.graph_models.GraphConvModel))
+    test1.append(isinstance(mp.model_wrapper.model, GraphConvModel))
     test1.append(mp.model_wrapper.model.model_dir == mp.model_wrapper.model_dir)
-    test1.append(mp.model_wrapper.model.graph_conv_layers == [100,100])
-    test1.append(mp.model_wrapper.model.dropout == [0.3,0.3,0.1])
+    test1.append([i.out_channel for i in mp.model_wrapper.model.model.graph_convs]== [100,100])
+    test1.append([i.rate for i in mp.model_wrapper.model.model.dropouts] == [0.3,0.3,0.1])
     test1.append(mp.model_wrapper.model.mode == 'regression')
-    test1.append(mp.model_wrapper.model.dense_layer_size == 10)
+    test1.append(mp.model_wrapper.model.model.dense.units == 10)
     assert all(test1)
     
     #***********************************************************************************
     def test_super_get_train_valid_pred_results():
-        """
-        Args:
+        """Args:
         perf_data: A PerfData object that stores the predicted values and metrics
         Returns:
         dict: A dictionary of the prediction results
@@ -346,8 +343,7 @@ def test_train_NN_graphconv_scaffold_inputs():
 
     #***********************************************************************************
     def test_super_get_test_perf_data():
-        """
-        Args:
+        """Args:
         model_dir (str): Directory where the saved model is stored
         model_dataset (DiskDataset): Stores the current dataset and related methods
 
@@ -371,8 +367,7 @@ def test_train_NN_graphconv_scaffold_inputs():
 
     #***********************************************************************************
     def test_super_get_test_pred_results():
-        """
-        Args:
+        """Args:
         model_dir (str): Directory where the saved model is stored
         model_dataset (DiskDataset): Stores the current dataset and related methods
 
@@ -395,8 +390,7 @@ def test_train_NN_graphconv_scaffold_inputs():
 
     #***********************************************************************************
     def test_super_get_full_dataset_perf_data():
-        """
-        Args:
+        """Args:
         model_dataset (DiskDataset): Stores the current dataset and related methods
 
         Returns:
@@ -417,8 +411,7 @@ def test_train_NN_graphconv_scaffold_inputs():
 
     #***********************************************************************************
     def test_super_get_full_dataset_pred_results():
-        """
-        Args:
+        """Args:
         model_dataset (DiskDataset): Stores the current dataset and related methods
         Returns:
         dict: A dictionary containing predicted values and metrics for the current full dataset

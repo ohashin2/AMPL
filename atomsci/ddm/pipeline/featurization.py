@@ -1,23 +1,30 @@
-"""
-Classes providing different methods of featurizing compounds and other data entities
-"""
+"""Classes providing different methods of featurizing compounds and other data entities"""
 
 import logging
 import os
 import sys
 import tempfile
 import pdb
+import time
 
 import numpy as np
 import deepchem as dc
 import pandas as pd
-from deepchem.data.data_loader import featurize_smiles_df
 import deepchem.data.data_loader as dl
+from deepchem.data import NumpyDataset
 
 from atomsci.ddm.utils import datastore_functions as dsf
+from atomsci.ddm.pipeline import transformations as trans
+from atomsci.ddm.pipeline import parameter_parser as pp
+from atomsci.ddm.pipeline import model_datasets as md
+from atomsci.ddm.pipeline import model_pipeline as mp
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem import rdmolfiles
+from rdkit.Chem import rdmolops
+from rdkit.Chem import Descriptors
+from rdkit.ML.Descriptors import MoleculeDescriptors
 
 subclassed_mordred_classes = ['EState', 'MolecularDistanceEdge']
 try:
@@ -25,28 +32,54 @@ try:
     from mordred.EState import AtomTypeEState, AggrType
     from mordred.MolecularDistanceEdge import MolecularDistanceEdge
     from mordred import BalabanJ, BertzCT, HydrogenBond, MoeType, RotatableBond, SLogP, TopoPSA
-    rdkit_desc_mods = [BalabanJ, BertzCT, HydrogenBond, MoeType, RotatableBond, SLogP, TopoPSA]
+    #rdkit_desc_mods = [BalabanJ, BertzCT, HydrogenBond, MoeType, RotatableBond, SLogP, TopoPSA]
     mordred_supported = True
 except ImportError:
     mordred_supported = False
 
 feather_supported = True
 try:
-    import feather
+    import pyarrow.feather as feather
 except (ImportError, AttributeError, ModuleNotFoundError):
     feather_supported = False
-    
-# Ignore failure to import Gomez-Bombarelli autoencoder package (doesn't work in some 
-# LC environments that don't have Keras installed)
-try:
-    from mol_vae_features import MoleculeVAEFeaturizer
-except ImportError:
-    pass
+
+# TODO: Commented out for now, because Gomez-Bombarelli autoencoder package doesn't work 
+# with the version of Keras that is part of TensorFlow 2.5. Eventually we'll replace this
+# with the JT-VAE and/or Wasserstein autoencoders.
+#try:
+#    from mol_vae_features import MoleculeVAEFeaturizer
+#except ImportError:
+#    pass
 
 import collections
 
 logging.basicConfig(format='%(asctime)-15s %(message)s')
 log = logging.getLogger('ATOM')
+
+
+
+# ****************************************************************************************
+def make_weights(vals):
+    """In the case of multitask learning, we must create weights for each sample labeling
+    it with 0 if there is not value or 1 if there is.
+
+    Args:
+        vals: numpy array containing nans where there are not labels
+
+    Returns:
+        vals: numpy array same as input vals, but nans are replaced with 0
+        w: numpy array same shape as vals, where w[i,j] = 1 if vals[i,j] is nan else w[i,j] = 0
+    """
+    # sometimes instead of nan, '' is used for missing values
+    out_vals = np.copy(vals)
+    if not np.issubdtype(out_vals.dtype, np.number):
+        # there might be strings or other objects in this array
+        out_vals[out_vals==''] = np.nan
+    
+    out_vals = out_vals.astype(float)
+    w = np.where(np.isnan(out_vals), 0, 1).astype(float)
+
+    return out_vals, w
 
 
 # ****************************************************************************************
@@ -61,11 +94,14 @@ def create_featurization(params):
 
     Raises:
         ValueError: If params.featurizer not in ['ecfp','graphconv','molvae','computed_descriptors','descriptors']
-        
+
     """
     #TODO: Change molvae to generic autoencoder
-    if params.featurizer in ('ecfp', 'graphconv', 'molvae'):
+    if params.featurizer in ('ecfp', 'graphconv', 'molvae') \
+            or params.featurizer in pp.featurizer_wl:
         return DynamicFeaturization(params)
+    elif params.featurizer == 'embedding':
+        return EmbeddingFeaturization(params)
     elif params.featurizer in ('descriptors'):
         return DescriptorFeaturization(params)
     elif params.featurizer in ('computed_descriptors'):
@@ -75,8 +111,7 @@ def create_featurization(params):
 
 # ****************************************************************************************
 def remove_duplicate_smiles(dset_df, smiles_col='rdkit_smiles'):
-    """
-    Remove any rows with duplicate SMILES strings from the given dataset.
+    """Remove any rows with duplicate SMILES strings from the given dataset.
 
     Args:
         dset_df (DataFrame): The dataset table.
@@ -85,7 +120,7 @@ def remove_duplicate_smiles(dset_df, smiles_col='rdkit_smiles'):
 
     Returns:
         filtered_dset_df (DataFrame): The dataset filtered to remove duplicate SMILES strings.
-        
+
     """
     log.warning("Duplicate smiles strings: " + str([(item, count) for item, count in collections.Counter(
         dset_df[smiles_col].values.tolist()).items() if count > 1]))
@@ -96,8 +131,7 @@ def remove_duplicate_smiles(dset_df, smiles_col='rdkit_smiles'):
 
 # ****************************************************************************************
 def get_dataset_attributes(dset_df, params):
-    """
-    Construct a table mapping compound IDs to SMILES strings and possibly other attributes
+    """Construct a table mapping compound IDs to SMILES strings and possibly other attributes
     (e.g., dates) specified in params.
 
     Args:
@@ -116,10 +150,37 @@ def get_dataset_attributes(dset_df, params):
         params.smiles_col: dset_df[params.smiles_col].values},
         index=dset_df[params.id_col])
     if params.date_col is not None:
-        #attr_df[params.date_col] = pd.to_datetime(dset_df[params.date_col])
         attr_df[params.date_col] = [np.datetime64(d) for d in dset_df[params.date_col].values]
-    #pdb.set_trace()
     return attr_df
+
+# ****************************************************************************************
+def featurize_smiles(df, featurizer, smiles_col, log_every_N=1000):
+    """Replacement for DeepChem 2.1 featurize_smiles_df function, which is buggy. Computes
+    features using featurizer for dataframe df column given by smiles_col. Returns them as
+    a numpy array, along with an array 'is_valid' indicating which rows of the input
+    dataframe yielded valid features.
+    """
+    smiles_strs = df[smiles_col].values
+
+    features = []
+    for ind, smiles in enumerate(smiles_strs):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            new_order = rdmolfiles.CanonicalRankAtoms(mol)
+            mol = rdmolops.RenumberAtoms(mol, new_order)
+        if ind % log_every_N == 0:
+            log.info("Featurizing sample %d" % ind)
+        features.append(featurizer.featurize([mol]))
+    is_valid = np.array([1 if elt.size > 0 else 0 for elt in features], dtype=bool)
+    feat_array = np.array([elt for (is_valid, elt) in zip(is_valid, features) if is_valid])
+    if len(feat_array.shape) > 1:
+        feat_array = np.squeeze(feat_array, axis=1)
+    else:
+        log.debug("featurize_smiles() produced 1-D array of size %d" % feat_array.shape[0])
+        log.debug("Input SMILES had length %d" % len(smiles_strs))
+        log.debug("Number of valid SMILES is %d" % sum(is_valid))
+    return feat_array, is_valid
+
 
 # ****************************************************************************************
 # Module-level functions for RDKit and Mordred descriptor calculations
@@ -128,8 +189,7 @@ def get_dataset_attributes(dset_df, params):
 
 # ****************************************************************************************
 def get_2d_mols(smiles_strs):
-    """
-    Convert SMILES strings to RDKit Mol objects without explicit hydrogens or 3D coordinates
+    """Convert SMILES strings to RDKit Mol objects without explicit hydrogens or 3D coordinates
 
     Args:
         smiles_strs (iterable of str): List of SMILES strings to convert
@@ -138,7 +198,7 @@ def get_2d_mols(smiles_strs):
         tuple (mols, is_valid):
             mols (ndarray of Mol): Mol objects for valid SMILES strings only
             is_valid (ndarray of bool): True for each input SMILES string that was valid according to RDKit
-            
+
     """
     log.debug('Converting SMILES to RDKit Mols')
     mols = [Chem.MolFromSmiles(smi) for smi in smiles_strs]
@@ -147,8 +207,7 @@ def get_2d_mols(smiles_strs):
     return mols, is_valid
 
 def get_3d_mols(smiles_strs):
-    """
-    Convert SMILES strings to Mol objects with explicit hydrogens and 3D coordinates
+    """Convert SMILES strings to Mol objects with explicit hydrogens and 3D coordinates
 
     Args:
         smiles_strs (iterable of str): List of SMILES strings to convert
@@ -157,7 +216,7 @@ def get_3d_mols(smiles_strs):
         tuple (mols, is_valid):
             mols (ndarray of Mol): Mol objects for valid SMILES strings only
             is_valid (ndarray of bool): True for each input SMILES string that was valid according to RDKit
-            
+
     """
     log.debug('Converting SMILES to RDKit Mols')
     nsmiles = len(smiles_strs)
@@ -184,8 +243,7 @@ def get_3d_mols(smiles_strs):
 
 
 def compute_2d_mordred_descrs(mols):
-    """
-    Compute 2D Mordred descriptors only
+    """Compute 2D Mordred descriptors only
 
     Args:
         mols: List of RDKit mol objects for molecules to compute descriptors for.
@@ -196,12 +254,15 @@ def compute_2d_mordred_descrs(mols):
     """
     calc = get_mordred_calculator(ignore_3D=True)
     res_df = calc.pandas(mols)
-    res_df = res_df.fill_missing().applymap(float)
-    return res_df
+    try:
+        res_df = res_df.fill_missing().applymap(float)
+        return res_df
+    except ValueError:
+        log.error('Mordred descriptor calculation failed in MordredDataFrame.fill_missing')
+        return None
 
 def compute_all_mordred_descrs(mols, max_cpus=None, quiet=True):
-    """
-    Compute all Mordred descriptors, including 3D ones
+    """Compute all Mordred descriptors, including 3D ones
 
     Args:
         mols: List of RDKit mol objects for molecules to compute descriptors for.
@@ -218,13 +279,16 @@ def compute_all_mordred_descrs(mols, max_cpus=None, quiet=True):
     log.debug("Computing Mordred descriptors")
     res_df = calc.pandas(mols, quiet=quiet, nproc=max_cpus)
     log.debug("Done computing Mordred descriptors")
-    res_df = res_df.fill_missing().applymap(float)
-    return res_df
+    try:
+        res_df = res_df.fill_missing().applymap(float)
+        return res_df
+    except ValueError:
+        log.error('Mordred descriptor calculation failed in MordredDataFrame.fill_missing')
+        return None
 
 def compute_mordred_descriptors_from_smiles(smiles_strs, max_cpus=None, quiet=True, smiles_col='rdkit_smiles'):
-    """
-    Compute 2D and 3D Mordred descriptors for the given list of SMILES strings.
-    
+    """Compute 2D and 3D Mordred descriptors for the given list of SMILES strings.
+
     Args:
         smiles_strs:    A list or array of SMILES strings
 
@@ -233,25 +297,33 @@ def compute_mordred_descriptors_from_smiles(smiles_strs, max_cpus=None, quiet=Tr
         quiet (bool):   If True, suppress displaying a progress indicator while computing descriptors.
 
         smiles_col (str): The name of the column that will contain SMILES strings in the returned data frame.
-        
+
     Returns: tuple
-        desc_df (DataFrame): A table of Mordred descriptors for the input SMILES strings that were valid 
+        desc_df (DataFrame): A table of Mordred descriptors for the input SMILES strings that were valid
                         (according to RDKit), together with those SMILES strings.
 
-        is_valid (ndarray of bool): An array of length the same as smiles_strs, indicating which SMILES strings 
+        is_valid (ndarray of bool): An array of length the same as smiles_strs, indicating which SMILES strings
                             were considered valid.
-                            
+
     """
     mols3d, is_valid = get_3d_mols(smiles_strs)
+    if not np.any(is_valid):
+        log.error("No valid SMILES strings input to compute_mordred_descriptors_from_smiles.")
+        log.error("First input SMILES = %s" % smiles_strs[0])
+        return None, is_valid
     desc_df = compute_all_mordred_descrs(mols3d, max_cpus, quiet=quiet)
     valid_smiles = np.array(smiles_strs)[is_valid]
-    desc_df[smiles_col] = valid_smiles
+    if desc_df is not None:
+        desc_df[smiles_col] = valid_smiles
+    else:
+        log.debug('Descriptor calculation failed for one of the following SMILES strings:')
+        for smi in valid_smiles:
+            log.debug(smi)
     return desc_df, is_valid
 
 
-def compute_all_rdkit_descrs(mols):
-    """
-    Compute all RDKit descriptors
+def compute_all_rdkit_descrs(mol_df, mol_col = "mol"):
+    """Compute all RDKit descriptors
 
     Args:
         mols: List of RDKit Mol objects to compute descriptors for.
@@ -260,13 +332,51 @@ def compute_all_rdkit_descrs(mols):
         res_df (DataFrame): Data frame containing computed descriptors.
 
     """
-    calc = get_rdkit_calculator()
-    res_df = calc.pandas(mols)
-    return res_df
+    all_desc = [x[0] for x in Descriptors._descList]
+    calc = get_rdkit_calculator(all_desc)
+    cds=[]
+    for mol in mol_df[mol_col]:
+        cd = calc.CalcDescriptors(mol)
+        cds.append(cd)
+    df2=pd.DataFrame(cds, columns=all_desc, index=mol_df.index)
+    mol_df=mol_df.join(df2, lsuffix='', rsuffix='_rdk')
+    return mol_df
+    
+
+def compute_rdkit_descriptors_from_smiles(smiles_strs, smiles_col='rdkit_smiles'):
+    """Compute 2D and 3D RDKit descriptors for the given list of SMILES strings.
+
+    Args:
+        smiles_strs:    A list or array of SMILES strings
+
+        max_cpus:       The maximum number of cores to use for computing descriptors. The default value None means
+                        that all available cores will be used.
+        quiet (bool):   If True, suppress displaying a progress indicator while computing descriptors.
+
+        smiles_col (str): The name of the column that will contain SMILES strings in the returned data frame.
+
+    Returns: tuple
+        desc_df (DataFrame): A table of Mordred descriptors for the input SMILES strings that were valid
+                        (according to RDKit), together with those SMILES strings.
+
+        is_valid (ndarray of bool): An array of length the same as smiles_strs, indicating which SMILES strings
+                            were considered valid.
+
+    """
+    mols3d, is_valid = get_3d_mols(smiles_strs)
+    mol_df = pd.DataFrame({"mol": mols3d})
+    desc_df = compute_all_rdkit_descrs(mol_df)
+    valid_smiles = np.array(smiles_strs)[is_valid]
+    if desc_df is not None:
+        desc_df[smiles_col] = valid_smiles
+    else:
+        log.debug('Descriptor calculation failed for one of the following SMILES strings:')
+        for smi in valid_smiles:
+            log.debug(smi)
+    return desc_df, is_valid
 
 def get_mordred_calculator(exclude=subclassed_mordred_classes, ignore_3D=False):
-    """
-    Create a Mordred calculator with all descriptor modules registered except those whose names are in the exclude list.
+    """Create a Mordred calculator with all descriptor modules registered except those whose names are in the exclude list.
     Register ATOM versions of the classes in those modules instead.
 
     Args:
@@ -288,13 +398,12 @@ def get_mordred_calculator(exclude=subclassed_mordred_classes, ignore_3D=False):
     return calc
 
 
-def get_rdkit_calculator():
-    """
-    Create a Mordred calculator with only the RDKit wrapper descriptor modules registered 
-    """
-    calc = Calculator(ignore_3D=True)
-    for desc_mod in rdkit_desc_mods:
-        calc.register(desc_mod, ignore_3D=True)
+def get_rdkit_calculator(desc_list):
+    """Create a Mordred calculator with only the RDKit wrapper descriptor modules registered"""
+    #calc = Calculator(ignore_3D=True)
+    #for desc_mod in rdkit_desc_mods:
+    #    calc.register(desc_mod, ignore_3D=True)
+    calc = MoleculeDescriptors.MolecularDescriptorCalculator(desc_list)
     return calc
 
 
@@ -302,8 +411,7 @@ def get_rdkit_calculator():
 # Module-level functions for MOE descriptor calculations
 # ****************************************************************************************
 def compute_all_moe_descriptors(smiles_df, params):
-    """
-    Run MOE to compute all 317 standard descriptors.
+    """Run MOE to compute all 317 standard descriptors.
 
     Args:
         smiles_df (DataFrame): Table containing SMILES strings and compound IDs
@@ -316,31 +424,40 @@ def compute_all_moe_descriptors(smiles_df, params):
     """
 
     # TODO: Get MOE_PATH from params
-    moe_path = os.environ.get('MOE_PATH', '/usr/workspace/wsb/gskcraa/tools/moe2018/bin')
+    moe_path = os.environ.get('MOE_PATH', '/usr/workspace/atom/moe2020_site/moe2020_site/bin')
+    if not os.path.exists(moe_path):
+        raise Exception("MOE is not available, or MOE_PATH environment variable needs to be set.")
     moe_root = os.path.abspath('%s/..' % moe_path)
     # Make sure we have an environment variable that points to the license server
     if os.environ.get('LM_LICENSE_FILE', None) is None:
-        os.environ['LM_LICENSE_FILE'] = '7788@nephi.llnl.gov'
+        os.environ['LM_LICENSE_FILE'] = '7002@bribe.llnl.gov'
 
     moe_args = []
     moe_args.append("{moePath}/moebatch".format(moePath=moe_path))
     moe_args.append("-mpu")
-    moe_args.append("3")
-    moe_args.append("-exec")
+    if params.moe_threads < 0:
+        # By default use all available cores but one, times 2 for hyperthreading
+        moe_threads = 2 * len(os.sched_getaffinity(0)) - 2
+    else:
+        moe_threads = params.moe_threads
+    moe_args.append('%d' % moe_threads)
 
+    moe_args.append("-exec")
+    # TODO: Directory with svl scripts should be part of AMPL installation. The code below is specific to the LC environment.
     moe_template = """db_Close db_Open['{fileMDB}','create']; db_ImportASCII[ascii_file: '{smilesFile}',
     db_file: '{fileMDB}',delimiter: ',', quotes: 0, names: ['original_smiles','cmpd_id'],types: ['char','char']];
     run ['{moeRoot}/custom/ksm_svl/smp_WashMinimizeSMILES.svl', ['{fileMDB}', 'original_smiles']];
     run ['{moeRoot}/custom/svl/db_desc_smp5.svl',['{fileMDB}','mol_prep', [], [codeset: 'All_No_MOPAC_Protein']]];
     dir_export_ASCIIBB ['{fileMDB}',[quotes:1,titles:1]];"""
-    
+
     #with tempfile.TemporaryDirectory() as tmpdir:
     tmpdir = tempfile.mkdtemp()
+    curdir = os.getcwd()
     if True:
         # Write SMILES strings and compound IDs to a temp file
         smiles_file = '%s/smiles4moe.csv' % tmpdir
         file_mdb = 'smiles4moe.mdb'
-        smiles_df.to_csv(smiles_file, index=False, header=False, columns=[params.smiles_col, params.id_col])
+        smiles_df.to_csv(smiles_file, index=False, columns=[params.smiles_col, params.id_col])
         log.debug("Wrote SMILES strings to %s" % smiles_file)
         os.chdir(tmpdir)
         moe_cmds = '"' + moe_template.format(moeRoot=moe_root, smilesFile=smiles_file, fileMDB=file_mdb) + '"'
@@ -361,11 +478,14 @@ def compute_all_moe_descriptors(smiles_df, params):
                 log.error('MOE descriptor calculation failed.')
                 return None
             log.debug("Reading descriptors from %s" % output_file)
-            result_df = pd.read_csv(output_file, index_col=False)
+            result_df = pd.read_csv(output_file, index_col=False,
+                            dtype={'cmpd_id':'string'}) # IDs should always be treated as strings
             result_df = result_df.rename(columns={'cmpd_id' : params.id_col, 'original_smiles' : params.smiles_col})
+            os.chdir(curdir)
             return result_df
         except Exception as e:
             log.error('Failed to invoke MOE to compute descriptors: %s' % str(e))
+            os.chdir(curdir)
             raise
 
 
@@ -394,14 +514,16 @@ class Featurization(object):
         self.feat_type = params.featurizer
 
     # ****************************************************************************************
-    def featurize_data(self, dset_df, model_dataset):
+    def featurize_data(self, dset_df, params, contains_responses):
         """Perform featurization on the given dataset.
 
         Args:
             dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns.
             for the compound ID and assay value; for some featurizers, must also contain a SMILES string column.
 
-            model_dataset (ModelDataset): Dataset to be featurized.
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
 
         Raises:
             NotImplementedError: Must be implemented by concrete subclasses
@@ -411,12 +533,12 @@ class Featurization(object):
         raise NotImplementedError
 
     # ****************************************************************************************
-    def extract_prefeaturized_data(self, merged_dset_df, model_dataset):
+    def extract_prefeaturized_data(self, featurized_dset_df, params):
         """Extracts dataset features, values, IDs and attributes from the given prefeaturized data frame.
         Args:
-            merged_dset_df (DataFrame): Data frame for the dataset.
+            featurized_dset_df (DataFrame): Data frame for the dataset.
 
-            model_dataset (ModelDataset): Backpointer to the ModelDataset object for the dataset to be featurized.
+            params (Namespace): Parsed parameters for model.
 
         Raises:
             NotImplementedError: Must be implemented by concrete subclasses
@@ -530,15 +652,24 @@ class DynamicFeaturization(Featurization):
             self.featurizer_obj = dc.feat.CircularFingerprint(size=params.ecfp_size, radius=params.ecfp_radius)
         elif self.feat_type == 'graphconv':
             self.featurizer_obj = dc.feat.ConvMolFeaturizer()
-        #TODO: potentially make generic
-        elif self.feat_type == 'molvae':
-            self.featurizer_obj = MoleculeVAEFeaturizer(params.mol_vae_model_file)
+        elif self.feat_type in pp.featurizer_wl:
+            kwargs = pp.extract_featurizer_params(params)
+            self.featurizer_obj = pp.featurizer_wl[self.feat_type](**kwargs)
+        elif self.feat_type == 'embedding':
+            # EmbeddingFeaturization doesn't map directly to a DeepChem featurizer
+            self.featurizer_obj = None
+
+        #TODO: MoleculeVAEFeaturizer is not working currently. Will be replaced by JT-VAE and cWAE
+        # featurizers eventually.
+        #elif self.feat_type == 'molvae':
+        #    self.featurizer_obj = MoleculeVAEFeaturizer(params.mol_vae_model_file)
         else:
             raise ValueError("Unknown featurization type %s" % self.feat_type)
 
     # ****************************************************************************************
     def __str__(self):
         """Returns a human-readable description of this Featurization object.
+
         Returns:
             (str): Describes the featurization type
         """
@@ -546,40 +677,39 @@ class DynamicFeaturization(Featurization):
 
     # ****************************************************************************************
     def featurize(self,mols) :
-        """Calls DeepChem featurize() object
-        """
+        """Calls DeepChem featurize() object"""
 
         return self.featurizer_obj.featurize(mols)
 
     # ****************************************************************************************
-    def extract_prefeaturized_data(self, merged_dset_df, model_dataset):
+    def extract_prefeaturized_data(self, featurized_dset_df, params):
         """Attempts to extract prefeaturized data for the given dataset. For dynamic featurizers, we don't save
         this data, so this method always returns None.
-        Args:
-            merged_dset_df (DataFrame): dataset merged with the featurizers
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
+        Args:
+            featurized_dset_df (DataFrame): dataset merged with the featurizers
+
+            params (Namespace): Parsed parameters for model.
+
         Returns:
             None, None, None, None
         """
         return None, None, None, None
 
     # ****************************************************************************************
-    # TODO: Replace model_dataset in this function with params; make params.response_cols required.
-    # TODO: MJT, make params.response_cols required?
-    # TODO: MJT, test featurize data after refactoring out model_dataset.
-    def featurize_data(self, dset_df, model_dataset):
+    def featurize_data(self, dset_df, params, contains_responses):
         """Perform featurization on the given dataset.
 
         Args:
             dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns
             for the compound ID and assay value; for some featurizers, must also contain a SMILES string column.
-            # TODO: remove model_dataset after ensuring response_cols are set correctly.
 
-            model_dataset (ModelDataset): Contains the dataset to be featurized
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
 
         Returns:
-            Tuple of (features, ids, vals, attr).
+            Tuple of (features, ids, vals, attr, weights, featurized_dset_df):
 
             features (np.array): Feature matrix.
 
@@ -588,39 +718,45 @@ class DynamicFeaturization(Featurization):
             vals (np.array): array of response values.
 
             attr (pd.DataFrame): dataframe containing SMILES strings indexed by compound IDs.
+
+            weights (np.array): Array of compound weights
+
+            featurized_dset_df (pd.DataFrame): Data frame combining id, SMILES and response columns from input data frame
+            with generated feature columns.
+
         """
-        params = model_dataset.params
         attr = get_dataset_attributes(dset_df, params)
-        features, is_valid = featurize_smiles_df(dset_df, featurizer=self.featurizer_obj, field=params.smiles_col,
-                                                   verbose=False)
+        features, is_valid = featurize_smiles(dset_df, featurizer=self.featurizer_obj, smiles_col=params.smiles_col)
         if features is None:
             raise Exception("Featurization failed for dataset")
         # Some SMILES strings may not be featurizable. This filters for only valid IDs.
-        # ksm: Changed name of 'valid_inds' to 'is_valid', because it's an array of bools, not a list of indices.
 
         nrows = sum(is_valid)
         ncols = len(params.response_cols)
-        if model_dataset.contains_responses:
-            ##JEA: ORIG code below
-            ##vals = dset_df[params.response_cols].values[is_valid,:]
-            ##JEA: UPDATED code below
-            ##JEA: the W's need to be initialized here, the function below
-            ##JEA: will set weights to 0 for missing values
-            ##JEA: Featurize task results iff they exist.
-            dset_df=dset_df.replace(np.nan, "", regex=True)
-            # print(dset_df.head())
-            vals, w = dl.convert_df_to_numpy(dset_df, params.response_cols) #, self.id_field)
-            # Filter out examples where featurization failed.
-            vals, w = (vals[is_valid], w[is_valid])
-            # print(vals)
-            # print(w)
+
+        # Select columns to include from the input dataset in the featurized dataset data frame
+        dset_cols = [params.id_col, params.smiles_col]
+        if contains_responses:
+            dset_cols += params.response_cols
+        if params.date_col is not None:
+            dset_cols.append(params.date_col)
+        keep_df = dset_df[dset_cols][is_valid].reset_index(drop=True)
+        if len(features.shape) > 1:
+            feat_df = pd.DataFrame(features, columns=[f"c{i}" for i in range(features.shape[1])])
+        else:
+            feat_df = pd.DataFrame(dict(c0=features))
+        featurized_dset_df = pd.concat([keep_df, feat_df], ignore_index=False, axis=1)
+
+        if contains_responses and (params.model_type != 'hybrid'):
+            vals, w = make_weights(featurized_dset_df[params.response_cols].values) #, self.id_field)
         else:
             vals = np.zeros((nrows,ncols))
             w = np.ones((nrows,ncols)) ## JEA
         attr = attr[is_valid]
-        ids = dset_df[model_dataset.params.id_col][is_valid]
-        assert len(features) == len(ids) == len(vals) == len(w) ## JEA 
-        return features, ids, vals, attr, w
+        ids = featurized_dset_df[params.id_col]
+
+        assert len(features) == len(ids) == len(vals) == len(w) ## JEA
+        return features, ids, vals, attr, w, featurized_dset_df
 
     # ****************************************************************************************
     def create_feature_transformer(self, dataset):
@@ -633,7 +769,8 @@ class DynamicFeaturization(Featurization):
         Returns:
             Empty list since we will not be transforming the features of a DynamicFeaturization object
         """
-        #TODO: Add comment describing why this is always returning an empty list
+        # Dynamic features such as ECFP fingerprints are not typically scaled and centered. This behavior
+        # can be overridden if necessary by specific subclasses.
         return []
 
     # ****************************************************************************************
@@ -647,7 +784,7 @@ class DynamicFeaturization(Featurization):
         Raises:
             Exception: This method is not supported by the DynamicFeaturization subclass
         """
-        raise Exception("DynamicFeaturization doesn't support get_featurized_dset_name()")
+        raise NotImplementedError("DynamicFeaturization doesn't support get_featurized_dset_name()")
 
 
     # ****************************************************************************************
@@ -677,7 +814,7 @@ class DynamicFeaturization(Featurization):
 
     # ****************************************************************************************
     def get_feature_count(self):
-        """Returns the number of feature columns associated with this Featurization instance. 
+        """Returns the number of feature columns associated with this Featurization instance.
 
         Args:
             None
@@ -691,6 +828,13 @@ class DynamicFeaturization(Featurization):
             return self.featurizer_obj.feature_length()
         elif self.feat_type == 'molvae':
             return self.featurizer_obj.latent_rep_size
+        elif self.feat_type == 'MolGraphConvFeaturizer':
+            # https://deepchem.readthedocs.io/en/latest/api_reference/featurizers.html#molgraphconvfeaturizer
+            # 30 atom features plus 11 edge features
+            return 44
+        elif self.feat_type in pp.featurizer_wl:
+            # It's kind of hard to count some of these features
+            return None
 
     # ****************************************************************************************
     def get_feature_specific_metadata(self, params):
@@ -717,7 +861,174 @@ class DynamicFeaturization(Featurization):
             # TODO: If the parameter name for the model file changes to 'autoencoder_model_key', change it below.
             mol_vae_params = {'autoencoder_model_key': params.mol_vae_model_file}
             feat_metadata['autoencoder_specific'] = mol_vae_params
+        elif self.feat_type in pp.featurizer_wl:
+            feat_metadata['auto_featurizer_specific'] = pp.extract_featurizer_params(params, strip_prefix=False)
         return feat_metadata
+
+# ****************************************************************************************
+class EmbeddingFeaturization(DynamicFeaturization):
+    """Featurizer that uses a pretrained AMPL neural network model to compute features consisting
+    of the activations from the "embedding" layer of the network. For this to work, the underlying
+    DeepChem model must implement the predict_embedding function.
+    """
+
+    def __init__(self, params):
+        """Initializes an EmbeddingFeaturization object.
+
+        Args:
+            params (Namespace): Contains parameters to be used to instantiate the featurizer.
+
+        Raises:
+            ValueError if neither embedding_model_uuid or embedding_model_path is specified in params.
+
+        Side effects:
+            Sets the following EmbeddingFeaturization attributes:
+                embedding_pipeline: A ModelPipeline object for the embedding model.
+        """
+        super().__init__(params)
+        log_level = log.getEffectiveLevel()
+        if params.embedding_model_path is not None:
+            self.embedding_pipeline = mp.create_prediction_pipeline_from_file(params, reload_dir=None,
+                                        model_path=params.embedding_model_path)
+        elif params.embedding_model_uuid is not None:
+            self.embedding_pipeline = mp.create_prediction_pipeline(params, params.embedding_model_uuid,
+                                        collection_name=params.embedding_model_collection)
+        else:
+            raise ValueError("EmbeddingFeaturizer: must specify either embedding_model_uuid or embedding_model_path")
+        # Restore the logging level, which may have been changed by the create_prediction_pipeline function
+        log.setLevel(log_level)
+
+
+    # ****************************************************************************************
+    def __str__(self):
+        """Returns a human-readable description of this Featurization object.
+
+        Returns:
+            (str): Describes the featurization type
+        """
+        return f"EmbeddingFeaturization based on model UUID {self.embedding_pipeline.model_uuid}"
+
+    # ****************************************************************************************
+    def featurize(self,mols) :
+        """Calls DeepChem featurize() object"""
+
+        # TODO Does this actually get called externally?
+        raise NotImplementedError
+
+    # ****************************************************************************************
+    def featurize_data(self, dset_df, params, contains_responses):
+        """Perform featurization on the given dataset.
+
+        Args:
+            dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns
+            for the compound ID and SMILES string
+
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
+
+        Returns:
+            Tuple of (features, ids, vals, attr, weights, featurized_dset_df):
+
+            features (np.array): Feature matrix.
+
+            ids (pd.DataFrame): Compound IDs or SMILES strings if needed for splitting.
+
+            attr (pd.DataFrame): Data frame containing SMILES strings indexed by compound IDs.
+
+            vals (np.array): Array of response values.
+
+            weights (np.array): Array of compound weights
+
+            featurized_dset_df (pd.DataFrame): Data frame combining id, SMILES and response columns from input data frame
+            with generated feature columns.
+        """
+
+        # First featurize the molecules in dset_df using the featurizer of the embedding model. 
+
+        input_featurization = self.embedding_pipeline.model_wrapper.featurization
+        self.embedding_pipeline.featurization = input_featurization
+
+        input_model_dataset = md.create_minimal_dataset(self.embedding_pipeline.params,
+                                    input_featurization, contains_responses=True)
+
+        input_dset_df = dset_df.copy()
+        if contains_responses:
+            colmap = {}
+            for orig_col, embed_col in zip(params.response_cols, self.embedding_pipeline.params.response_cols):
+                colmap[orig_col] = embed_col
+            input_dset_df = input_dset_df.rename(columns=colmap)
+        input_model_dataset.get_featurized_data(input_dset_df)
+        input_dataset = input_model_dataset.dataset
+        input_features = input_dataset.X
+        ids = input_dataset.ids
+        vals = input_dataset.y
+        weights = input_dataset.w
+        attr = input_model_dataset.attr
+
+        input_dataset = self.embedding_pipeline.model_wrapper.transform_dataset(input_dataset)
+
+        # Run the embedding model to generate features. 
+        embedding = self.embedding_pipeline.model_wrapper.generate_embeddings(input_dataset)
+
+        # The DeepChem predict_embedding methods pad their outputs to multiples of the batch size.
+        # Strip off this extra padding.
+        nrows = input_features.shape[0]
+        embedding = embedding[:nrows,:]
+
+        # Select columns to include from the input dataset in the featurized dataset data frame
+        dset_cols = [params.id_col, params.smiles_col]
+        if contains_responses:
+            dset_cols += params.response_cols
+        if params.date_col is not None:
+            dset_cols.append(params.date_col)
+        keep_df = dset_df[dset_cols]
+        feat_df = pd.DataFrame(embedding, columns=[f"c{i}" for i in range(embedding.shape[1])])
+        featurized_dset_df = pd.concat([keep_df, feat_df], ignore_index=False, axis=1)
+
+        return embedding, ids, vals, attr, weights, featurized_dset_df
+
+    # ****************************************************************************************
+    def get_feature_count(self):
+        """Returns the number of feature columns associated with this Featurization instance.
+
+        Args:
+            None
+
+        Returns:
+            (int): The number of feature columns for the DynamicFeaturization subclass, feat_type specific
+        """
+        # For GraphConv models, the embedding layer is a GraphGather layer that effectively doubles the number 
+        # of nodes in the final Dense layer, which is given by the last element of params.layer_sizes.
+        # For other NN models, the embedding layer has the number of nodes specified by that last element.
+        if self.embedding_pipeline.params.featurizer == 'graphconv':
+            return 2*self.embedding_pipeline.params.layer_sizes[-1]
+        else:
+            return self.embedding_pipeline.params.layer_sizes[-1]
+
+
+    # ****************************************************************************************
+    def get_feature_specific_metadata(self, params):
+        """Returns a dictionary of parameter settings for this Featurization object that are specific
+        to the feature type.
+
+        Args:
+            params (Namespace): Argparse Namespace object containing the parameter list
+
+        Returns
+            dict: Dictionary containing featurizer specific metadata as a subdict under the key
+            'embedding_specific'.
+        """
+        feat_metadata = {}
+
+        embedding_params = dict(
+            embedding_model_uuid = params.embedding_model_uuid,
+            embedding_model_collection = params.embedding_model_collection,
+            embedding_model_path = params.embedding_model_path)
+        feat_metadata['embedding_specific'] = embedding_params
+
+        return feat_metadata
+
 
 # ****************************************************************************************
 
@@ -736,13 +1047,13 @@ class PersistentFeaturization(Featurization):
         super().__init__(params)
 
     # ****************************************************************************************
-    def extract_prefeaturized_data(self, merged_dset_df, model_dataset):
+    def extract_prefeaturized_data(self, featurized_dset_df, params):
         """Attempts to extract prefeaturized data for the given dataset.
-        
-        Args:
-            merged_dset_df (DataFrame): dataset merged with the featurizers
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
+        Args:
+            featurized_dset_df (DataFrame): dataset merged with the featurizers
+
+            params (Namespace): Parsed parameters for model.
 
         Raises:
             NotImplementedError: Currently, only DescriptorFeaturization is supported, is not a generic method
@@ -751,29 +1062,36 @@ class PersistentFeaturization(Featurization):
         raise NotImplementedError
 
     # ****************************************************************************************
-    def featurize_data(self, dset_df, model_dataset):
+    def featurize_data(self, dset_df, params, contains_responses):
         """Perform featurization on the given dataset.
 
         Args:
             dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns.
             for the compound ID and assay value; for some featurizers, must also contain a SMILES string column.
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
 
         Returns:
-            Tuple of (features, ids, vals, attr).
-                features (np.array): Feature matrix.
-                
-                ids (pd.DataFrame): compound IDs or SMILES strings if needed for splitting.
-                
-                attr (pd.DataFrame): dataframe containing SMILES strings indexed by compound IDs.
-                
-                vals (np.array): array of response values.
+            Tuple of (features, ids, vals, attr, weights, featurized_dset_df):
+
+            features (np.array): Feature matrix.
+
+            ids (pd.DataFrame): Compound IDs or SMILES strings if needed for splitting.
+
+            attr (pd.DataFrame): Data frame containing SMILES strings indexed by compound IDs.
+
+            vals (np.array): Array of response values.
+
+            weights (np.array): Array of compound weights
+
+            featurized_dset_df (pd.DataFrame): Data frame combining id, SMILES and response columns from input data frame
+            with generated feature columns.
 
         Raises:
-            NotImplementedError: Currently, only DescriptorFeaturization is supported, is not a generic method
+            NotImplementedError: Implemented by subclasses.
         """
-        #TODO: Add comment describing why this is not implemented
         raise NotImplementedError
 
     # ****************************************************************************************
@@ -785,7 +1103,7 @@ class PersistentFeaturization(Featurization):
             dataset (deepchem.Dataset): featurized dataset
 
         """
-        #TODO: Add comment describing why this is always returning an empty list
+        # Leave it to subclasses to determine if features should be scaled and centered.
         return []
 
 # ****************************************************************************************
@@ -793,23 +1111,23 @@ class PersistentFeaturization(Featurization):
 class DescriptorFeaturization(PersistentFeaturization):
     """Subclass for featurizers that map sets of (usually) precomputed descriptors to compound IDs; the resulting merged
     dataset is persisted to the filesystem or datastore.
+    
     Attributes:
         Set in __init_:
         feat_type (str): Type of featurizer, set in super.(__init__)
-        
+
         descriptor_type (str): The type of descriptor
-        
+
         descriptor_key (str): The path to the descriptor featurization matrix if it saved to a file,
         or the key to the file in the Datastore
-        
+
         descriptor_base (str/path): The base path to the descriptor featurization matrix
-        
+
         precomp_descr_table (pd.DataFrame): initialized as an empty DataFrame, will be overridden to contain the
         full descriptor table
-            
+
     Class attributes:
         supported_descriptor_types
-        
         all_desc_col
     """
 
@@ -827,40 +1145,45 @@ class DescriptorFeaturization(PersistentFeaturization):
     def load_descriptor_spec(cls, desc_spec_bucket, desc_spec_key) :
         """Read a descriptor specification table from the datastore or the filesystem.
         The table is a CSV file with the following columns:
+
         descr_type:     A string specifying a descriptor source/program and a subset of descriptor columns
-        
+
         source:         Name of the program/package that generates the descriptors
+
         scaled:         Binary indicator for whether subset of descriptor values are scaled by molecule's atom count
-        
+
         descriptors:    A semicolon separated list of descriptor columns.
-            
+
         The values in the table are used to set class variables desc_type_cols, desc_type_source and desc_type_scaled.
 
         Args:
             desc_spec_bucket : bucket where descriptor spec is located
 
             desc_spec_key: data store key, or full file path to locate descriptor spec object
-            
+
         Returns:
             None
 
         Side effects:
             Sets the following class variables:
-            
+
             cls.desc_type_cols -> map from decriptor types to their associated descriptor column names
-            
+
             cls.desc_type_source -> map from decriptor types to the program/package that generates them
-            
+
             cls.desc_type_scaled -> map from decriptor types to boolean indicators of whether some descriptor
             values are scaled.
-            
+
             cls.supported_descriptor_types  -> the list of available descriptor types
         """
 
-        try:
-            ds_client = dsf.config_client()
-        except Exception as e:
+        if desc_spec_bucket == '':
             ds_client = None
+        else:
+            try:
+                ds_client = dsf.config_client()
+            except Exception as e:
+                ds_client = None
         cls.desc_type_cols = {}
         cls.desc_type_scaled = {}
         cls.desc_type_source = {}
@@ -868,13 +1191,15 @@ class DescriptorFeaturization(PersistentFeaturization):
         # If a datastore client is not detected or a datastore bucket is not specified
         # assume that the ds_key is a full path pointer to a file on the file system. If that
         # file doesn't exist, use the fallback file installed with the AMPL package.
-        desc_spec_key_fallback = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
+        desc_spec_key_fallback = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                               'data', 'descriptor_sets_sources_by_descr_type.csv')
 
-        if ds_client is None or desc_spec_bucket == '':  
+        if ds_client is None or desc_spec_bucket == '':
             if os.path.exists(desc_spec_key):
+                log.debug("Reading descriptor spec table from %s" % desc_spec_key)
                 desc_spec_df = pd.read_csv(desc_spec_key, index_col=False)
             else:
+                log.debug("Reading descriptor spec table from %s" % desc_spec_key_fallback)
                 desc_spec_df = pd.read_csv(desc_spec_key_fallback, index_col=False)
         else :
             # Try the descriptor_spec_key parameter first, then fall back to package file
@@ -893,7 +1218,6 @@ class DescriptorFeaturization(PersistentFeaturization):
 
         cls.supported_descriptor_types = list(cls.desc_type_source.keys())
 
-
     def __init__(self, params):
         """Initializes a DescriptorFeaturization object. This is a good place to load data used by the featurizer,
         such as a table of descriptors.
@@ -903,30 +1227,32 @@ class DescriptorFeaturization(PersistentFeaturization):
 
         Side effects:
             Sets the following attributes of DescriptorFeaturization:
-            
+
             feat_type (str): Type of featurizer, set in __init__
-            
+
             descriptor_type (str): The type of descriptor
-            
+
             descriptor_key (str): The path to the precomputed descriptor table if it is saved to a file, or
             the key to the file in the Datastore
-            
+
             descriptor_base (str/path): The base name of the precomputed descriptor table file, without the
             directory and extension
-            
+
             precomp_descr_table (pd.DataFrame): The precomputed descriptor table itself. Initialized as an empty
             DataFrame, will be replaced later on first call to featurize_data().
-            
+
             desc_id_col (str): Name of the column in precomp_descr_table containing compound IDs
-            
+
             desc_smiles_col (str): Name of the column in precomp_descr_table, if any, containing compound SMILES
         """
         super().__init__(params)
         cls = self.__class__
         # Load mapping between descriptor types and lists of descriptors
+        if not params.datastore:
+            params.descriptor_spec_bucket = ''
         if len(cls.supported_descriptor_types) == 0:
             cls.load_descriptor_spec(params.descriptor_spec_bucket, params.descriptor_spec_key)
-        
+
         if not params.descriptor_type in cls.supported_descriptor_types:
             raise ValueError("Unsupported descriptor type %s" % params.descriptor_type)
         self.descriptor_type = params.descriptor_type
@@ -937,7 +1263,7 @@ class DescriptorFeaturization(PersistentFeaturization):
             self.descriptor_base = None
         self.desc_id_col = None
         self.desc_smiles_col = None
-        
+
 
         # Load an empty descriptor table. We'll load the real table later the first time we need it.
         self.precomp_descr_table = pd.DataFrame()
@@ -950,46 +1276,45 @@ class DescriptorFeaturization(PersistentFeaturization):
         """
         return "DescriptorFeaturization with %s descriptors" % self.descriptor_type
 
-            
+
     # ****************************************************************************************
-    def extract_prefeaturized_data(self, merged_dset_df, model_dataset):
+    def extract_prefeaturized_data(self, featurized_dset_df, params):
         """Attempts to retrieve prefeaturized data for the given dataset.
 
         Args:
-            merged_dset_df (pd.DataFrame): dataset merged with the featurizers
+            featurized_dset_df (pd.DataFrame): dataset merged with the featurizers
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
-            # TODO: Remove model_dataset call once params.response_cols is properly set
+            params (Namespace): Parsed parameters for model.
 
         Returns:
             Tuple of (features, ids, vals, attr).
-            
+
             features (np.array): Feature matrix.
-            
+
             ids (pd.DataFrame): compound IDs or SMILES strings if needed for splitting.
-            
+
             attr (pd.DataFrame): dataframe containing SMILES strings indexed by compound IDs.
-            
+
             vals (np.array): array of response values.
 
         """
-        model_dataset.check_task_columns(merged_dset_df)
+        md.check_task_columns(params, featurized_dset_df)
         user_specified_features = self.get_feature_columns()
         featurizer_obj = dc.feat.UserDefinedFeaturizer(user_specified_features)
-        features = dc.data.data_loader.get_user_specified_features(merged_dset_df, featurizer=featurizer_obj,
+        features = get_user_specified_features(featurized_dset_df, featurizer=featurizer_obj,
                                                                    verbose=False)
         features = features.astype(float)
-        ids = merged_dset_df[model_dataset.params.id_col]
-        vals = merged_dset_df[model_dataset.params.response_cols].values
-        attr = get_dataset_attributes(merged_dset_df, model_dataset.params)
+        ids = featurized_dset_df[params.id_col]
+        vals = featurized_dset_df[params.response_cols].values
+        attr = get_dataset_attributes(featurized_dset_df, params)
+
         return features, ids, vals, attr
 
     # ****************************************************************************************
     def load_descriptor_table(self, params):
-        """
-        Load the table of precomputed feature values for the descriptor type specified in params, from
+        """Load the table of precomputed feature values for the descriptor type specified in params, from
         the datastore_key or path specified by params.descriptor_key and params.descriptor_bucket. Will try
-        to load the table from the local filesystem if possible, but the table should at least have a 
+        to load the table from the local filesystem if possible, but the table should at least have a
         metadata record in the datastore. The local file path is the same as descriptor_key on twintron-blue,
         and may be taken from the LC_path metadata property if it is set.
 
@@ -1002,23 +1327,26 @@ class DescriptorFeaturization(PersistentFeaturization):
         Side effects:
             Overwrites the attribute precomp_descr_table (pd.DataFrame) with the loaded descriptor table.
             Sets attributes desc_id_col and desc_smiles_col, if possible, based on the datastore metadata for the
-            descriptor table. Otherwise, sets them to reasonable defaults. Note that not all descriptor tables 
+            descriptor table. Otherwise, sets them to reasonable defaults. Note that not all descriptor tables
             contain SMILES strings, but one is required if the table is to be used with ComputedDescriptorFeaturization.
         """
 
         # Check if we have a datastore client to work with
-        try:
-            ds_client = dsf.config_client()
-        except Exception as e:
-            print('Exception when trying to connect to the datastore:')
-            print(e)
+        if params.datastore:
+            try:
+                ds_client = dsf.config_client()
+            except Exception as e:
+                log.warning('Exception when trying to connect to the datastore:')
+                log.warning(e)
+                ds_client = None
+        else:
             ds_client = None
         file_type = ''
         local_path = self.descriptor_key
         if ds_client != None :
             # First get the datastore metadata for the descriptor table. Ideally this will exist even if the table
             # itself lives in the filesystem.
-            desc_metadata = dsf.retrieve_dataset_by_datasetkey(self.descriptor_key, bucket=params.descriptor_bucket, 
+            desc_metadata = dsf.retrieve_dataset_by_datasetkey(self.descriptor_key, bucket=params.descriptor_bucket,
                                                                client=ds_client, return_metadata=True)
             file_type = desc_metadata['distribution']['dataType']
             kv_dict = dsf.get_key_val(desc_metadata['metadata'])
@@ -1071,29 +1399,37 @@ class DescriptorFeaturization(PersistentFeaturization):
                 if smiles_col in self.precomp_descr_table.columns.values:
                     self.desc_smiles_col = smiles_col
                     break
+        if self.desc_smiles_col is None:
+            raise Exception(f"No SMILES column found for descriptor table {self.descriptor_key}")
 
 
     # ****************************************************************************************
-    def featurize_data(self, dset_df, model_dataset):
+    def featurize_data(self, dset_df, params, contains_responses):
         """Perform featurization on the given dataset.
 
         Args:
             dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns.
             for the compound ID and assay value; for some featurizers, must also contain a SMILES string column.
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
-            # TODO: Remove model_dataset call once params.response_cols is properly set
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
 
         Returns:
-            Tuple of (features, ids, vals, attr).
-            
+            Tuple of (features, ids, vals, attr, weights, featurized_dset_df):
+
             features (np.array): Feature matrix.
-            
-            ids (pd.DataFrame): compound IDs or SMILES strings if needed for splitting.
-            
-            attr (pd.DataFrame): dataframe containing SMILES strings indexed by compound IDs.
-            
-            vals (np.array): array of response values
+
+            ids (pd.DataFrame): Compound IDs or SMILES strings if needed for splitting.
+
+            attr (pd.DataFrame): Data frame containing SMILES strings indexed by compound IDs.
+
+            vals (np.array): Array of response values
+
+            weights (np.array): Array of compound weights
+
+            featurized_dset_df (pd.DataFrame): Data frame combining id, SMILES and response columns from input data frame
+            with generated feature columns.
 
         Raises:
             Exception: if features is None, feautirzation failed for the dataset
@@ -1101,7 +1437,6 @@ class DescriptorFeaturization(PersistentFeaturization):
         Side effects:
             Overwrites the attribute precomp_descr_table (pd.DataFrame) with the appropriate descriptor table
         """
-        params = model_dataset.params
         # Compound ID and SMILES columns will be labeled the same as in the input dataset, unless overridden by
         # properties of the precomputed descriptor table
         self.load_descriptor_table(params)
@@ -1116,32 +1451,33 @@ class DescriptorFeaturization(PersistentFeaturization):
         # already has a column of the same name
         if params.smiles_col not in self.precomp_descr_table.columns.values:
             dset_cols.append(params.smiles_col)
-        if model_dataset.contains_responses:
+        if contains_responses:
             dset_cols += params.response_cols
-        merged_dset_df = dset_df[dset_cols].merge(
-                self.precomp_descr_table, how='inner', left_on=params.id_col, right_on=self.desc_id_col)
-        
-        model_dataset.save_featurized_data(merged_dset_df)
+        featurized_dset_df = dset_df[dset_cols].merge(
+                self.precomp_descr_table, how='left', left_on=params.id_col, right_on=self.desc_id_col)
 
         user_specified_features = self.get_feature_columns()
 
         featurizer_obj = dc.feat.UserDefinedFeaturizer(user_specified_features)
-        features = dc.data.data_loader.get_user_specified_features(merged_dset_df, featurizer=featurizer_obj,
+        features = get_user_specified_features(featurized_dset_df, featurizer=featurizer_obj,
                                                                    verbose=False)
         if features is None:
             raise Exception("Featurization failed for dataset")
 
-        ids = merged_dset_df[params.id_col]
+        ids = featurized_dset_df[params.id_col]
 
         nrows = len(ids)
         ncols = len(params.response_cols)
-        if model_dataset.contains_responses:
-            vals = merged_dset_df[params.response_cols].values
+        if contains_responses and (params.model_type != 'hybrid'):
+            vals = featurized_dset_df[params.response_cols].values
+            vals, weights = make_weights(vals)
         else:
             vals = np.zeros((nrows,ncols))
+            weights = np.ones_like(vals, dtype=np.float32)
 
         attr = attr.loc[ids]
-        return features, ids, vals, attr, None
+
+        return features, ids, vals, attr, weights, featurized_dset_df
 
     # ****************************************************************************************
     def get_featurized_dset_name(self, dataset_name):
@@ -1179,12 +1515,12 @@ class DescriptorFeaturization(PersistentFeaturization):
             (list): List of column names of the features, pulled from DescriptorFeaturization attributes
 
         """
-       
+
         return self.__class__.desc_type_cols[self.descriptor_type ]
 
     # ****************************************************************************************
     def get_feature_count(self):
-        """Returns the number of feature columns associated with this Featurization instance. 
+        """Returns the number of feature columns associated with this Featurization instance.
 
         Args:
             None
@@ -1202,10 +1538,11 @@ class DescriptorFeaturization(PersistentFeaturization):
 
         Args:
             dataset (deepchem.Dataset): featurized dataset
+
         Returns:
             (list of DeepChem transformer objects): list of transformers for the feature matrix
         """
-        transformers_x = [dc.trans.NormalizationTransformer(transform_X=True, dataset=dataset)]
+        transformers_x = [trans.NormalizationTransformerMissingData(transform_X=True, dataset=dataset)]
         return transformers_x
 
 
@@ -1213,6 +1550,7 @@ class DescriptorFeaturization(PersistentFeaturization):
     def get_feature_specific_metadata(self, params):
         """Returns a dictionary of parameter settings for this Featurization object that are specific
         to the feature type.
+
         Args:
             params (Namespace): Argparse Namespace argument containing the parameters
         """
@@ -1233,38 +1571,38 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
 
     Attributes:
         Set in __init_:
-        
+
         feat_type (str): Type of featurizer, set in super.(__init__)
-        
+
         descriptor_type (str): The type of descriptor
-        
+
         descriptor_key (str): The path to the descriptor featurization matrix if it saved to a file, or the key to
         the file in the Datastore
-        
+
         descriptor_base (str/path): The base path to the descriptor featurization matrix
-        
+
         precomp_descr_table (pd.DataFrame): initialized as empty df, will be overridden to contain full descriptor table
     """
 
 
     def __init__(self, params):
-        """Initializes a ComputedDescriptorFeaturization object. 
+        """Initializes a ComputedDescriptorFeaturization object.
 
         Args:
             params (Namespace): Contains parameters to be used to instantiate a featurizer.
 
         Side effects:
             Sets the following attributes of DescriptorFeaturization
-            
+
             feat_type (str): Type of featurizer, set in __init__
-            
+
             descriptor_type (str): The type of descriptor
-            
+
             descriptor_key (str): The path to the descriptor featurization matrix if it saved to a file,
             or the key to the file in the Datastore
-            
+
             descriptor_base (str/path): The base path to the descriptor featurization matrix
-            
+
             precomp_descr_table (pd.DataFrame): initialized as an empty DataFrame, will be overridden to contain
             the full descriptor table
         """
@@ -1276,7 +1614,7 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
 
 
     # ****************************************************************************************
-    def featurize_data(self, dset_df, model_dataset):
+    def featurize_data(self, dset_df, params, contains_responses):
         """Perform featurization on the given dataset, by computing descriptors from SMILES strings or matching them
         to SMILES in precomputed table.
 
@@ -1284,34 +1622,41 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
             dset_df (DataFrame): A table of data to be featurized. At minimum, should include columns.
             for the compound ID and assay value; for some featurizers, must also contain a SMILES string column.
 
-            model_dataset (ModelDataset): Object containing the dataset to be featurized
+            params (Namespace): Parsed parameters to be used for featurization.
+
+            contains_responses (bool): Whether the dataset being featurized contains response columns.
 
         Returns:
-            Tuple of (features, ids, vals, attr).
-            
+            Tuple of (features, ids, vals, attr, weights, featurized_dset_df):
+
             features (np.array): Feature matrix.
-            
+
             ids (pd.DataFrame): compound IDs or SMILES strings if needed for splitting.
-            
+
             attr (pd.DataFrame): dataframe containing SMILES strings indexed by compound IDs.
-            
+
             vals (np.array): array of response values
 
+            weights (np.array): Array of compound weights
+
+            featurized_dset_df (pd.DataFrame): Data frame combining id, SMILES and response columns from input data frame
+            with feature columns.
+
         Raises:
-            Exception: if features is None, feautirzation failed for the dataset
+            Exception: if features is None, featurization failed for the dataset
 
         Side effects:
             Loads a precomputed descriptor table and sets self.precomp_descr_table to point to it, if one is
             specified by params.descriptor_key.
-            
+
         """
-        params = model_dataset.params
         use_precomputed = False
         descr_cols = self.get_feature_columns()
 
         # Try to load a precomputed descriptor table, and check that it's useful to us
         if params.descriptor_key is not None and self.precomp_descr_table.empty:
             self.load_descriptor_table(params)
+        if not self.precomp_descr_table.empty:
             if self.desc_smiles_col is None or self.desc_id_col is None:
                 log.warning("Precomputed descriptor table %s lacks a SMILES column and/or an ID column." % params.descriptor_key)
                 log.warning("Will compute all descriptors on the fly.")
@@ -1342,92 +1687,96 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
         dset_cols = [params.id_col, params.smiles_col]
         if params.date_col is not None:
             dset_cols.append(params.date_col)
-        if model_dataset.contains_responses:
+        if contains_responses:
             dset_cols += params.response_cols
-        input_df = dset_df[dset_cols]
+        keep_df = dset_df[dset_cols]
+
+        # Make a table with duplicate SMILES removed. Later we'll join the descriptors back to the original
+        # table.
+        input_df = keep_df.drop_duplicates(subset=params.smiles_col)[[params.id_col, params.smiles_col]]
 
         # Identify which SMILES strings in the dataset need to have descriptors calculated for them and
         # which already have them precomputed
-        dset_smiles = dset_df[params.smiles_col].values
+        dset_smiles = set(input_df[params.smiles_col].values)
         if use_precomputed:
-            calc_smiles = list(set(dset_smiles) - set(self.precomp_descr_table[self.desc_smiles_col].values))
-            precomp_smiles = list(set(dset_smiles) - set(calc_smiles))
+            calc_smiles = dset_smiles - set(self.precomp_descr_table[self.desc_smiles_col].values)
+            precomp_smiles = dset_smiles - calc_smiles
         else:
             calc_smiles = dset_smiles
-            precomp_smiles = []
+            precomp_smiles = set()
 
         # Compute descriptors for the compounds that need them
         if len(calc_smiles) > 0:
             calc_smiles_df = input_df[input_df[params.smiles_col].isin(calc_smiles)]
             calc_desc_df, is_valid = self.compute_descriptors(calc_smiles_df, params)
-            calc_merged_df = calc_smiles_df[is_valid].reset_index(drop=True)
+            calc_smiles_feat_df = calc_smiles_df[is_valid].reset_index(drop=True)[[params.smiles_col]]
             for col in descr_cols:
-                calc_merged_df[col] = calc_desc_df[col]
-            # Get rid of any extra columns
-            calc_merged_df = calc_merged_df[dset_cols+descr_cols]
+                calc_smiles_feat_df[col] = calc_desc_df[col]
 
             if len(precomp_smiles) == 0:
-                merged_dset_df = calc_merged_df
+                uniq_smiles_feat_df = calc_smiles_feat_df
 
             # Add the newly computed descriptors to the precomputed table
+            new_desc_df = calc_desc_df.rename(columns={params.smiles_col : self.desc_smiles_col,
+                                                       params.id_col : self.desc_id_col})
             if self.precomp_descr_table.empty:
-                self.precomp_descr_table = calc_desc_df
+                self.precomp_descr_table = new_desc_df
             else:
-                self.precomp_descr_table = pd.concat([self.precomp_descr_table, calc_desc_df], ignore_index=True)
+                self.precomp_descr_table = pd.concat([self.precomp_descr_table, new_desc_df], ignore_index=True)
 
         # Merge descriptors from the precomputed table for the remaining compounds
         if len(precomp_smiles) > 0:
-            precomp_smiles_df = input_df[input_df[params.smiles_col].isin(precomp_smiles)]
-            precomp_merged_df = precomp_smiles_df.merge(self.precomp_descr_table, how='inner',
-                                                        left_on=params.smiles_col,
-                                                        right_on=self.desc_smiles_col,
-                                                        suffixes=('', '_y'))
+            precomp_smiles_feat_df = self.precomp_descr_table[self.precomp_descr_table[self.desc_smiles_col].isin(
+                                                                                                    precomp_smiles)].copy()
+            if (params.smiles_col in precomp_smiles_feat_df.columns.values):
+                psf_df = precomp_smiles_feat_df
+            else:
+                psf_df = precomp_smiles_feat_df.rename(columns={self.desc_smiles_col : params.smiles_col})
+
             # Remove duplicate SMILES matches
-            precomp_merged_df = precomp_merged_df.drop_duplicates(subset=[params.smiles_col])
+            psf_df = psf_df.drop_duplicates(subset=params.smiles_col)
 
             # Get rid of any extra columns
-            precomp_merged_df = precomp_merged_df[dset_cols+descr_cols]
+            psf_df = psf_df[[params.smiles_col]+descr_cols]
 
             if len(calc_smiles) == 0:
-                merged_dset_df = precomp_merged_df
+                uniq_smiles_feat_df = psf_df
 
         # Combine the computed and precomputed data frames, if we had both
         if len(precomp_smiles) > 0 and len(calc_smiles) > 0:
-            merged_dset_df = pd.concat([calc_merged_df, precomp_merged_df], ignore_index=True)
+            uniq_smiles_feat_df = pd.concat([calc_smiles_feat_df, psf_df], ignore_index=True)
 
-        # TODO (ksm): Replace nan feature values with averages over non-missing rows, so that scaling and centering
-        # works as it should.
-
+        # Merge descriptors with input data on SMILES strings.
+        featurized_dset_df = keep_df.merge(uniq_smiles_feat_df, how='left', on=params.smiles_col)
+        
         # Shuffle the order of rows, so that compounds with precomputed descriptors are intermixed with those having
-        # newly computed descriptors. This avoids bias later when doing scaffold splits; otherwise test set will be 
+        # newly computed descriptors. This avoids bias later when doing scaffold splits; otherwise test set will be
         # biased toward non-precomputed compounds.
-        merged_dset_df = merged_dset_df.sample(n=merged_dset_df.shape[0])
-
-        # Save the featurized dataset
-        model_dataset.save_featurized_data(merged_dset_df)
-
+        featurized_dset_df = featurized_dset_df.sample(frac=1.0)
 
         # Use the DeepChem featurizer to construct the feature array
         featurizer_obj = dc.feat.UserDefinedFeaturizer(descr_cols)
-        features = dc.data.data_loader.get_user_specified_features(merged_dset_df, featurizer=featurizer_obj,
+        features = get_user_specified_features(featurized_dset_df, featurizer=featurizer_obj,
                                                                    verbose=False)
         if features is None:
             raise Exception("UserDefinedFeaturizer failed for dataset")
 
         # Construct the other components of a DeepChem Dataset object
-        ids = merged_dset_df[params.id_col]
+        ids = featurized_dset_df[params.id_col]
         nrows = len(ids)
         ncols = len(params.response_cols)
-        if model_dataset.contains_responses:
-            vals = merged_dset_df[params.response_cols].values
+        if contains_responses and (params.model_type != 'hybrid'):
+            vals = featurized_dset_df[params.response_cols].values
+            vals, weights = make_weights(vals)
         else:
             vals = np.zeros((nrows,ncols))
+            weights = np.ones_like(vals, dtype=np.float32)
 
         # Create a table of SMILES strings and other attributes indexed by compound IDs
-        attr = get_dataset_attributes(merged_dset_df, params)
+        attr = get_dataset_attributes(featurized_dset_df, params)
 
-        return features, ids, vals, attr, None
-        
+        return features, ids, vals, attr, weights, featurized_dset_df
+
     # ****************************************************************************************
     def get_featurized_dset_name(self, dataset_name):
         """Returns a name for the featurized dataset, for use in filenames or dataset keys.
@@ -1438,15 +1787,14 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
 
         Returns:
             (str): A name for the feauturized dataset
-            
+
         """
         return '%s_with_%s_descriptors.csv' % (dataset_name, self.descriptor_type)
 
 
     # ****************************************************************************************
     def compute_descriptors(self, smiles_df, params):
-        """
-        Compute descriptors for the SMILES strings given in smiles_df.
+        """Compute descriptors for the SMILES strings given in smiles_df.
 
         Args:
             smiles_df: DataFrame containing SMILES strings to compute descriptors for.
@@ -1476,19 +1824,22 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
             ret_df = ret_df.join(desc_df, how='inner')
 
         elif descr_source == 'rdkit':
-            # TODO (ksm): mordred computes a subset of RDKit descriptors, but apparently they have different
-            # names from the ones generated directly by RDKit. Hold off on this until we have code in place
-            # to call RDKit directly.
-            raise Exception("RDKit descriptor computations are not yet supported.")
-            #desc_df, is_valid = self.compute_rdkit_descriptors(smiles_df[params.smiles_col].values)
+            desc_df, is_valid = self.compute_rdkit_descriptors(smiles_df, smiles_col = params.smiles_col)
+            desc_df = desc_df[descr_cols]
+            # Add the ID and SMILES columns to the returned data frame
+            ret_df = smiles_df[is_valid][[params.id_col, params.smiles_col]].reset_index(drop=True)
+            ret_df = ret_df.rename(columns={params.id_col : self.desc_id_col,
+                                        params.smiles_col : self.desc_smiles_col})
+            desc_df = desc_df.reset_index(drop=True)
+            ret_df = ret_df.join(desc_df, how='inner')
 
         elif descr_source == 'moe':
-            if params.system != 'LC':
-                raise Exception("MOE descriptors currently can only be computed on LC systems.")
             desc_df, is_valid = self.compute_moe_descriptors(smiles_df, params)
             # Add scaling by a_count if descr_scaled is True
             if descr_scaled:
                 ret_df = self.scale_moe_descriptors(desc_df, params.descriptor_type)
+            else:
+                ret_df = desc_df
 
         else:
             raise ValueError('Unsupported descriptor_type %s' % params.descriptor_type)
@@ -1498,8 +1849,7 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
 
     # ****************************************************************************************
     def compute_mordred_descriptors(self, smiles_strs, params):
-        """
-        Compute Mordred descriptors for the given list of SMILES strings
+        """Compute Mordred descriptors for the given list of SMILES strings
 
         Args:
             smiles_strs (iterable): SMILES strings to compute descriptors for.
@@ -1520,9 +1870,8 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
         return desc_df, is_valid
 
     # ****************************************************************************************
-    def compute_rdkit_descriptors(self, smiles_strs):
-        """
-        Compute RDKit descriptors for the given list of SMILES strings
+    def compute_rdkit_descriptors(self, smiles_df, smiles_col="rdkit_smiles"):
+        """Compute RDKit descriptors for the given list of SMILES strings
 
         Args:
             smiles_strs: SMILES strings to compute descriptors for.
@@ -1535,14 +1884,13 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
                 is_valid (ndarray of bool): True for each input SMILES string that was valid according to RDKit
 
         """
-        mols2d, is_valid = get_2d_mols(smiles_strs)
-        desc_df = compute_all_rdkit_descrs(mols2d)
+        smiles_df["mol"], is_valid = get_3d_mols(smiles_df[smiles_col])
+        desc_df = compute_all_rdkit_descrs(smiles_df, "mol")
         return desc_df, is_valid
 
     # ****************************************************************************************
     def compute_moe_descriptors(self, smiles_df, params):
-        """
-        Compute MOE descriptors for the given list of SMILES strings
+        """Compute MOE descriptors for the given list of SMILES strings
 
         Args:
             smiles_strs (iterable): SMILES strings to compute descriptors for.
@@ -1559,15 +1907,11 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
         """
         nsmiles = smiles_df.shape[0]
         desc_df = compute_all_moe_descriptors(smiles_df, params)
+
         # MOE ignores SMILES strings it can't parse, so we have to mark as invalid the corresponding
         # input compounds
         desc_ids = set(desc_df[params.id_col].values)
         is_valid = np.array([id in desc_ids for id in smiles_df[params.id_col].values])
-        nrows = desc_df.shape[0]
-
-        # Check for output rows that are all missing values
-        #descr_cols = self.get_feature_columns()
-
         num_invalid = len(is_valid) - sum(is_valid)
         if num_invalid > 0:
             log.warning("MOE did not compute descriptors for %d/%d SMILES strings" % (num_invalid, nsmiles))
@@ -1575,8 +1919,7 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
 
     # ****************************************************************************************
     def scale_moe_descriptors(self, desc_df, descr_type):
-        """
-        Scale selected descriptors computed by MOE by dividing their values by the atom count per molecule.
+        """Scale selected descriptors computed by MOE by dividing their values by the atom count per molecule.
 
         Args:
             desc_df (DataFrame): Data frame containing computed descriptors.
@@ -1598,8 +1941,44 @@ class ComputedDescriptorFeaturization(DescriptorFeaturization):
                 scaled_df[scaled_col] = desc_df[unscaled_col].values / a_count
             else:
                 scaled_df[scaled_col] = desc_df[unscaled_col].values
-        return scaled_df
+        return scaled_df.copy()
 
+    # ****************************************************************************************
+    def __str__(self):
+        """Returns a human-readable description of this Featurization object.
+        Returns:
+            (str): Describes the featurization type
+        """
+        return "ComputedDescriptorFeaturization with %s descriptors" % self.descriptor_type
+
+# ****************************************************************************************
+def get_user_specified_features(df, featurizer, verbose=False):
+    """Temp fix for DC 2.3 issue. See
+    https://github.com/deepchem/deepchem/issues/1841
+    """
+
+    """Extract and merge user specified features.
+
+    Merge features included in dataset provided by user
+    into final features dataframe
+
+    Three types of featurization here:
+
+    1) Molecule featurization
+    -) Smiles string featurization
+    -) Rdkit MOL featurization
+    2) Complex featurization
+    -) PDB files for interacting molecules.
+    3) User specified featurizations.
+
+    """
+    time1 = time.time()
+    df[featurizer.feature_fields] = df[featurizer.feature_fields].apply(pd.to_numeric)
+    X_shard =  df[featurizer.feature_fields].to_numpy()
+    time2 = time.time()
+    if verbose:
+        log.info("TIMING: user specified processing took %0.3f s" % (time2 - time1))
+    return X_shard
 
 # **************************************************************************************************************
 # Subclasses of Mordred descriptor classes
@@ -1609,24 +1988,22 @@ if mordred_supported:
 
     class ATOMAtomTypeEState(AtomTypeEState):
         """EState descriptors restricted to those that can be computed for most compounds"""
-        
+
         my_es_types = ['sCH3','dCH2','ssCH2','dsCH','aaCH','sssCH','tsC','dssC','aasC','aaaC','ssssC','sNH2','ssNH',
                        'aaNH','tN','dsN','aaN','sssN','ddsN','aasN','sOH','dO','ssO','aaO','sF','dS','ssS','aaS',
                        'ddssS','sCl','sBr']
-    
-    
+
+
         @classmethod
         def preset(cls, version):
             return (
                 cls(a, t) for a in [AggrType.count, AggrType.sum]
                           for t in cls.my_es_types
                 )
-    
+
     class ATOMMolecularDistanceEdge(MolecularDistanceEdge):
-        """
-        MolecularDistanceEdge descriptors restricted to those that can be computed for most compounds
-        """
-    
+        """MolecularDistanceEdge descriptors restricted to those that can be computed for most compounds"""
+
         @classmethod
         def preset(cls, version):
             return (cls(a, b, 6) for a in [2,3] for b in range(a, 4) )

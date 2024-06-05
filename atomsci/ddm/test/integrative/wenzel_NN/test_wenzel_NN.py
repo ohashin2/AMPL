@@ -12,15 +12,19 @@ import atomsci.ddm.pipeline.model_pipeline as mp
 import atomsci.ddm.pipeline.parameter_parser as parse
 import atomsci.ddm.utils.curate_data as curate_data
 import atomsci.ddm.utils.struct_utils as struct_utils
+import atomsci.ddm.utils.file_utils as futils
+from atomsci.ddm.utils import llnl_utils
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import integrative_utilities
 
 
 def clean():
-    """
-    Clean test files
-    """
+    """Clean test files"""
+    if not llnl_utils.is_lc_system():
+        assert True
+        return
+        
     for f in ['hlm_clearance_curated_predict.csv',
               'hlm_clearance_curated_external.csv',
               'hlm_clearance_curated_fit.csv',
@@ -36,11 +40,9 @@ def clean():
 
 
 def curate():
-    """
-    Curate dataset for model fitting
-    """
+    """Curate dataset for model fitting"""
     with zipfile.ZipFile('ci8b00785_si_001.zip', 'r') as zip_ref:
-        zip_ref.extractall('clearance')
+        futils.safe_extract(zip_ref, 'clearance')
 
     raw_df = pd.read_csv('clearance/SuppInfo/Dataset_chembl_clearcaco.txt', sep=";", dtype='str')
 
@@ -78,14 +80,12 @@ def curate():
     curated_df.to_csv(data_filename, index=False)
 
     # Create second test set by reproducible index for prediction
-    curated_df.tail(5000).to_csv('hlm_clearance_curated_fit.csv')
+    curated_df.tail(4989).to_csv('hlm_clearance_curated_fit.csv')
     curated_df.head(348).to_csv('hlm_clearance_curated_external.csv')
 
 
 def download():
-    """
-    Separate download function so that download can be run separately if there is no internet.
-    """
+    """Separate download function so that download can be run separately if there is no internet."""
     if (not os.path.isfile('ci8b00785_si_001.zip')):
         integrative_utilities.download_save(
             'https://pubs.acs.org/doi/suppl/10.1021/acs.jcim.8b00785/suppl_file/ci8b00785_si_001.zip', 'ci8b00785_si_001.zip', verify=False)
@@ -94,9 +94,7 @@ def download():
 
 
 def test():
-    """
-    Test full model pipeline: Curate data, fit model, and predict property for new compounds
-    """
+    """Test full model pipeline: Curate data, fit model, and predict property for new compounds"""
 
     # Clean
     # -----

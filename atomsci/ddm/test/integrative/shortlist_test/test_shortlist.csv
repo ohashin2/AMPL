@@ -1,0 +1,3 @@
+bucket,dataset_key,collection,response_cols
+public,data/MRP3_dataset.csv,test,pIC50
+public,data/delaney-processed_curated_fit.csv,test,VALUE_NUM_mean

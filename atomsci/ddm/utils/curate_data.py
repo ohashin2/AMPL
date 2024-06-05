@@ -1,6 +1,4 @@
-"""
-Utility functions used for AMPL dataset curation and creation.
-"""
+"""Utility functions used for AMPL dataset curation and creation."""
 
 """ TOC:
 aggregate_assay_data(assay_df, value_col='VALUE_NUM', output_value_col=None,
@@ -34,10 +32,10 @@ from atomsci.ddm.utils.struct_utils import get_rdkit_smiles, base_smiles_from_sm
 
 feather_supported = True
 try:
-    import feather
+    import pyarrow.feather as feather
 except (ImportError, AttributeError, ModuleNotFoundError):
     feather_supported = False
-    
+
 from rdkit import Chem
 from rdkit.Chem.Descriptors import MolWt
 
@@ -47,16 +45,16 @@ import matplotlib.pyplot as plt
 
 # ******************************************************************************************************************************************
 def set_group_permissions(path, system='AD', owner='GSK'):
-    """Set file group and permissions to standard values for a dataset containing proprietary
+    """Sets file and group permissions to standard values for a dataset containing proprietary
     data owned by 'owner'. Later we may add a 'public' option, or groups for data from other pharma companies.
 
     Args:
         path (string): File path
-
-        system (string): Computing environment from which group ownerships will be derived; currently, either 'LC' for LC 
+        
+        system (string): Computing environment from which group ownerships will be derived; currently, either 'LC' for LC
         filesystems or 'AD' for LLNL systems where owners and groups are managed by Active Directory.
-
-        owner (string): Who the data belongs to, either 'public' or the name of a company (e.g. 'GSK') associated with a 
+        
+        owner (string): Who the data belongs to, either 'public' or the name of a company (e.g. 'GSK') associated with a
         restricted access group.
 
     Returns:
@@ -66,39 +64,73 @@ def set_group_permissions(path, system='AD', owner='GSK'):
     # Currently, if we're not on an LC machine, we're on an AD-controlled system. This could change.
     if system != 'LC':
         system = 'AD'
-    owner_group_map = dict(GSK = {'LC' : 'gskcraa', 'AD' : 'gskusers-ad'}, 
+    owner_group_map = dict(GSK = {'LC' : 'gskcraa', 'AD' : 'gskusers-ad'},
                            public = {'LC' : 'atom', 'AD' : 'atom'} )
     group = owner_group_map[owner][system]
     shutil.chown(path, group=group)
     os.chmod(path, 0o770)
 
-
 # ******************************************************************************************************************************************
-def replicate_rmsd(dset_df, smiles_col='base_rdkit_smiles', value_col='PIC50', relation_col='relation'):
-    """
+def replicate_rmsd(dset_df, smiles_col='base_rdkit_smiles', value_col='PIC50', relation_col='relation', default_val=1.0):
+    """Compute RMS deviation of all replicate uncensored measurements from means
+
     Compute RMS deviation of all replicate uncensored measurements in dset_df from their means. Measurements are treated
     as replicates if they correspond to the same SMILES string, and are considered censored if the relation
     column contains > or <. The resulting value is meant to be used as an estimate of measurement error for all compounds
     in the dataset.
+
+    Args:
+        dset_df (DataFrame): DataFrame containing uncensored measurements and SMILES strings.
+
+        smiles_col (str): Name of the column that contains SMILES strings.
+
+        value_col (str): Name of the column that contains target values.
+
+        relation_col (str): The input DataFrame column containing relational operators (<, >, etc.).
+
+        default_val (float): The value to return if there are no compounds with replicate measurements.
+
+    Returns:
+        float: returns root mean squared deviation of all replicate uncensored measurements
+
     """
     dset_df = dset_df[~(dset_df[relation_col].isin(['<', '>']))]
     uniq_smiles, uniq_counts = np.unique(dset_df[smiles_col].values, return_counts=True)
     smiles_with_reps = uniq_smiles[uniq_counts > 1]
-    uniq_devs = []
-    for smiles in smiles_with_reps:
-        values = dset_df[dset_df[smiles_col] == smiles][value_col].values
-        uniq_devs.extend(values - values.mean())
-    uniq_devs = np.array(uniq_devs)
-    rmsd = np.sqrt(np.mean(uniq_devs ** 2))
+    if len(smiles_with_reps) > 0:
+        uniq_devs = []
+        for smiles in smiles_with_reps:
+            values = dset_df[dset_df[smiles_col] == smiles][value_col].values
+            uniq_devs.extend(values - values.mean())
+        uniq_devs = np.array(uniq_devs)
+        rmsd = np.sqrt(np.mean(uniq_devs ** 2))
+    else:
+        rmsd = default_val
     return rmsd
 
 # ******************************************************************************************************************************************
 def mle_censored_mean(cmpd_df, std_est, value_col='PIC50', relation_col='relation'):
-    """
+    """Computes maximum likelihood estimate of the true mean value for a single replicated compound.
+
     Compute a maximum likelihood estimate of the true mean value underlying the distribution of replicate assay measurements for a
     single compound. The data may be a mix of censored and uncensored measurements, as indicated by the 'relation' column in the input
-    data frame cmpd_df. std_est is an estimate for the standard deviation of the distribution, which is assumed to be Gaussian;
+    DataFrame cmpd_df. std_est is an estimate for the standard deviation of the distribution, which is assumed to be Gaussian;
     we typically compute a common estimate for the whole dataset using replicate_rmsd().
+
+    Args:
+        cmpd_df (DataFrame): DataFrame containing measurements and SMILES strings.
+
+        std_est (float): An estimate for the standard deviation of the distribution.
+
+        smiles_col (str): Name of the column that contains SMILES strings.
+
+        value_col (str): Name of the column that contains target values.
+
+        relation_col (str): The input DataFrame column containing relational operators (<, >, etc.).
+
+    Returns:
+        float: maximum likelihood estimate of the true mean for a replicated compound
+        str: Relation, '' not censored, '>' right censored, '<' left censored
     """
     left_censored = np.array(cmpd_df[relation_col].values == '<', dtype=bool)
     right_censored = np.array(cmpd_df[relation_col].values == '>' , dtype=bool)
@@ -134,7 +166,10 @@ def mle_censored_mean(cmpd_df, std_est, value_col='PIC50', relation_col='relatio
         # Then minimize it
         opt_res = minimize_scalar(loglik, method='brent')
         if not opt_res.success:
-            print('Likelihood maximization failed, message is: "%s"' % opt_res.message)
+            if 'message' in opt_res.keys():
+                print('Likelihood maximization failed, message is: "%s"' % opt_res.message)
+            else:
+                print('Likelihood maximization failed')
             mle_value = nan
         else:
             mle_value = opt_res.x
@@ -145,31 +180,44 @@ def mle_censored_mean(cmpd_df, std_est, value_col='PIC50', relation_col='relatio
 def aggregate_assay_data(assay_df, value_col='VALUE_NUM', output_value_col=None,
                          label_actives=True,
                          active_thresh=None,
-                         id_col='CMPD_NUMBER', smiles_col='rdkit_smiles', relation_col='VALUE_FLAG', date_col=None):
-    """
+                         id_col='CMPD_NUMBER', smiles_col='rdkit_smiles', relation_col='VALUE_FLAG', date_col=None, verbose=False):
+    """Aggregates replicated values in assay data
+
     Map RDKit SMILES strings in assay_df to base structures, then compute an MLE estimate of the mean value over replicate measurements
-    for the same SMILES strings, taking censoring into account. Generate an aggregated result table with one value for each unique base 
+    for the same SMILES strings, taking censoring into account. Generate an aggregated result table with one value for each unique base
     SMILES string, to be used in an ML-ready dataset.
 
-    :param assay_df: The input data frame to be processed.
-    :param value_col: The column in the data frame containing assay values to be averaged.
-    :param output_value_col: Optional; the column name to use in the output data frame for the averaged data.
-    :param label_actives: If True, generate an additional column 'active' indicating whether the mean value is above a threshold specified by active_thresh.
-    :param active_thresh: The threshold to be used for labeling compounds as active or inactive.
-    If active_thresh is None (the default), the threshold used is the minimum reported value across all records
-    with left-censored values (i.e., those with '<' in the relation column.
-    :param id_col: The input data frame column containing compound IDs.
-    :param smiles_col: The input data frame column containing SMILES strings.
-    :param relation_col: The input data frame column containing relational operators (<, >, etc.).
-    :param date_col: The input data frame column containing dates when the assay data was uploaded. If not None, the code will assign the earliest
-    date among replicates to the aggregate data record.
-    :return: A data frame containing averaged assay values, with one value per compound.
+    Args:
+        assay_df (DataFrame): The input DataFrame to be processed.
+
+        value_col (str): The column in the DataFrame containing assay values to be averaged.
+
+        output_value_col (str): Optional; the column name to use in the output DataFrame for the averaged data.
+
+        label_actives (bool): If True, generate an additional column 'active' indicating whether the mean value is above a threshold specified by active_thresh.
+
+        active_thresh (float): The threshold to be used for labeling compounds as active or inactive.
+            If active_thresh is None (the default), the threshold used is the minimum reported value across all records
+            with left-censored values (i.e., those with '<' in the relation column.
+
+        id_col (str): The input DataFrame column containing compound IDs.
+
+        smiles_col (str): The input DataFrame column containing SMILES strings.
+
+        relation_col (str): The input DataFrame column containing relational operators (<, >, etc.).
+
+        date_col (str): The input DataFrame column containing dates when the assay data was uploaded. If not None, the code will assign the earliest
+            date among replicates to the aggregate data record.
+
+    Returns:
+        A DataFrame containing averaged assay values, with one value per compound.
     """
 
     assay_df = assay_df.fillna({relation_col: '', smiles_col: ''})
     # Filter out rows where SMILES is missing
     n_missing_smiles = np.array([len(smiles) == 0 for smiles in assay_df[smiles_col].values]).sum()
-    print("%d entries in input table are missing SMILES strings" % n_missing_smiles)
+    if verbose:
+        print("%d entries in input table are missing SMILES strings" % n_missing_smiles)
     has_smiles = np.array([len(smiles) > 0 for smiles in assay_df[smiles_col].values])
     assay_df = assay_df[has_smiles].copy()
 
@@ -182,9 +230,10 @@ def aggregate_assay_data(assay_df, value_col='VALUE_NUM', output_value_col=None,
     norig = len(set(orig_smiles_strs))
     smiles_strs = [base_smiles_from_smiles(smiles, True) for smiles in orig_smiles_strs]
     assay_df['base_rdkit_smiles'] = smiles_strs
-    uniq_smiles_strs = list(set(smiles_strs))
+    uniq_smiles_strs = sorted(set(smiles_strs))
     nuniq = len(uniq_smiles_strs)
-    print("%d unique SMILES strings are reduced to %d unique base SMILES strings" % (norig, nuniq))
+    if verbose:
+        print("%d unique SMILES strings are reduced to %d unique base SMILES strings" % (norig, nuniq))
     smiles_map = dict([(smiles,i) for i, smiles in enumerate(uniq_smiles_strs)])
     smiles_indices = np.array([smiles_map.get(smiles, nuniq) for smiles in smiles_strs])
 
@@ -242,22 +291,56 @@ def aggregate_assay_data(assay_df, value_col='VALUE_NUM', output_value_col=None,
 
 # ******************************************************************************************************************************************
 def freq_table(dset_df, column, min_freq=1):
-    """
-    Generate a data frame tabulating the repeat frequencies of each unique value in 'vals'.
+    """Generate a DataFrame tabluating the repeat requencies of unique values.
+
+    Generate a DataFrame tabulating the repeat frequencies of each unique value in 'column'.
     Restrict it to values occurring at least min_freq times.
+
+    Args:
+        dset_df (DataFrame): An input DataFrame
+
+        column (str): The name of one column in DataFrame
+
+        min_freq (int): Restrict unique count to at least min_freq times.
+
+    Returns:
+        DataFrame: Dataframe containing two columns: the column passed in as the 'column' argument
+            and the column 'Count'. The 'Count' column contains the number of occurances for each
+            value in the 'column' argument.
     """
-    vals = dset_df[column].values
-    uniq_vals, counts = np.unique(vals, return_counts=True)
+    nmissing = sum(dset_df[column].isna())
+    filt_df = dset_df[dset_df[column].notna()]
+    uniq_vals, counts = np.unique(filt_df[column].values, return_counts=True)
+    uniq_vals = uniq_vals.tolist() + [np.nan]
+    counts = counts.tolist() + [nmissing]
     uniq_df = pd.DataFrame({column: uniq_vals, 'Count': counts}).sort_values(by='Count', ascending=False)
     uniq_df = uniq_df[uniq_df.Count >= min_freq]
     return uniq_df
 
 # ******************************************************************************************************************************************
 def labeled_freq_table(dset_df, columns, min_freq=1):
-    """
+    """Generate a frequency table in which additional columns are included.
+
     Generate a frequency table in which additional columns are included. The first column in 'columns'
     is assumed to be a unique ID; there should be a many-to-1 mapping from the ID to each of the additional
     columns.
+
+    Args:
+        dset_df (DataFrame): The input DataFrame.
+
+        columns (list(str)): A list of columns to include in the output frequency table.
+            The first column in 'columns' is assumed to be a unique ID; there should be
+            a many-to-1 mapping from the ID to each of the additional columns.
+
+        min_freq (int): Restrict unique count to at least min_freq times.
+
+    Returns:
+        DataFrame: A DataFrame containing a frequency table.
+
+    Raises:
+        Exception: If the DataFrame violates the rule: there should be a many-to-1
+            mapping from the ID to each of the additional columns.
+
     """
     id_col = columns[0]
     freq_df = freq_table(dset_df, id_col, min_freq=min_freq)
@@ -275,16 +358,31 @@ def labeled_freq_table(dset_df, columns, min_freq=1):
         freq_df[colname] = addl_vals[colname]
     return freq_df
 
-
 # ******************************************************************************************************************************************
 # The functions below are from Claire Weber's data_utils module.
 
 # ******************************************************************************************************************************************
-def filter_in_out_by_column_values (column, values, data, in_out):
-
+def filter_in_out_by_column_values(column, values, data, in_out):
     """Include rows only for given values in specified column.
-       column - column name.
-       values - list of acceptable values.
+
+    Given a DataFrame, column, and an iterable, Series, DataFrame, or dict, of values,
+    return a DataFrame with rows containing value in values or all rows
+    that do not containe a value in values.
+
+    Args:
+        column (str): Name of a column in data.
+
+        values (iterable): An iterable, Series, DataFrame, or dict of values
+            contained in data[column].
+
+        data (DataFrame): A DataFrame.
+
+        in_out (str): If set to 'in', will filter in rows that contain a value
+            in values. If set to anything else, this function will filter out
+            rows that contian a value in values.
+
+    Returns:
+        DataFrame: DataFrame containing filtered rows.
     """
 
     if in_out == 'in':
@@ -297,20 +395,61 @@ def filter_in_out_by_column_values (column, values, data, in_out):
 
 # ******************************************************************************************************************************************
 def filter_in_by_column_values (column, values, data):
+    """Include rows only for given values in specified column.
+
+    Filters in all rows in data if row[column] in values.
+
+    Args:
+        column (str): Name of a column in data.
+
+        values (iterable): An iterable, Series, DataFrame, or dict of values
+            contained in data[column].
+
+        data (DataFrame): A DataFrame.
+
+    Returns:
+        DataFrame: DataFrame containing filtered rows.
+    """
     return filter_in_out_by_column_values (column, values, data, 'in')
 
 
 # ******************************************************************************************************************************************
 def filter_out_by_column_values (column, values, data):
+    """Exclude rows only for given values in specified column.
+
+    Filters out all rows in data if row[column] in values.
+
+    Args:
+        column (str): Name of a column in data.
+
+        values (iterable): An iterable, Series, DataFrame, or dict of values
+            contained in data[column].
+
+        data (DataFrame): A DataFrame.
+
+    Returns:
+        DataFrame: DataFrame containing filtered rows.
+    """
     return filter_in_out_by_column_values (column, values, data, 'out')
 
 
 # ******************************************************************************************************************************************
 def filter_out_comments (values, values_cs, data):
-
     """Remove rows that contain the text listed
-       values - list of values that are not case sensitive
-       values_cs - list of values that are case sensitive
+
+    Removes any rows where data['COMMENTS'] contains the words in
+    values or values_cs. Used for removing results that indicate
+    bad data in the comments.
+
+    Args:
+        values (str): list of values that are not case sensitive
+
+        values_cs (str): list of values that are case sensitive
+
+        data (DataFrame): DataFrame containing a column named 'COMMENTS'
+
+    Returns:
+        DataFrame: Returns a DataFrame with the remaining rows
     """
 
     column = 'COMMENTS'
@@ -336,16 +475,23 @@ def filter_out_comments (values, values_cs, data):
 
 
 # ******************************************************************************************************************************************
+# DEPRECATED: This is extremely inefficient and inflexible. Probably this is only used in some legacy curation notebooks.
 def get_rdkit_smiles_parent (data):
+    """Strip the salts off the rdkit SMILES strings
+
+    First, loops through data and determines the base/parent smiles string for each row.
+    Appends the base smiles string to a new row in a list.
+    Then adds the list as a new column, 'rdkit_smiles_parent', in 'data'.
+    Basically calls base_smiles_from_smiles for each smile in the column 'rdkit_smiles'
+
+    Args:
+        data (DataFrame): A DataFrame with a column named 'rdkit_smiles'.
+
+    Returns:
+        DataFrame with column 'rdkit_smiles_parent' with salts stripped
+    """
     print ("")
-
     print ("Adding SMILES column 'rdkit_smiles_parent' with salts stripped...(may take a while)", flush=True)
-
-    """ ___Strip the salts off the rdkit SMILES strings___
-        First, loops through data and determines the base/parent smiles string for each row.
-        Appends the base smiles string to a new row in a list.
-        Then adds the list as a new column in 'data'"
-        """
 
     i_max = data.shape[0]
     rdkit_smiles_parent = []
@@ -364,19 +510,83 @@ def get_rdkit_smiles_parent (data):
     return data
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------
+def remove_outlier_replicates(df, response_col='pIC50', id_col='compound_id', max_diff_from_median=1.0):
+    """Examine groups of replicate measurements for compounds identified by compound ID and compute median response
+    for each group. Eliminate measurements that differ by more than a given value from the median; note that
+    in some groups this will result in all replicates being deleted. This function should be used together with
+    `aggregate_assay_data` instead of `average_and_remove_duplicates` to reduce data to a single value per compound.
+
+    Args:
+        df (DataFrame): Table of compounds and response data
+
+        response_col (str): Column containing response values
+
+        id_col (str): Column that uniquely identifies compounds, and therefore measurements to be treated as replicates.
+
+        max_diff_from_median (float): Maximum absolute difference from median value allowed for retained replicates.
+
+    Returns:
+        result_df (DataFrame): Filtered data frame with outlier replicates removed.
+
+    """
+
+    fr_df = freq_table(df, id_col, min_freq=2)
+    rep_ids = fr_df[id_col].values.tolist()
+    has_rep_df = df[df[id_col].isin(rep_ids)]
+    no_rep_df = df[~df[id_col].isin(rep_ids)]
+    gby = has_rep_df.groupby(id_col)
+    def filter_outliers(g_df):
+        med = np.median(g_df[response_col].values)
+        keep = ( np.abs( g_df[response_col].values - med ) <= max_diff_from_median)
+        return g_df[keep]
+    filt_df = gby.apply(filter_outliers)
+    n_removed = len(has_rep_df) - len(filt_df)
+    if n_removed > 0:
+        print(f"Removed {n_removed} {response_col} replicate measurements that were > {max_diff_from_median} from median")
+    result_df = pd.concat([filt_df, no_rep_df], ignore_index=True)
+    return result_df
+
 # ******************************************************************************************************************************************
-def average_and_remove_duplicates (column, tolerance, list_bad_duplicates, data, max_stdev = 100000, compound_id='CMPD_NUMBER',smiles_col='rdkit_smiles_parent'):
-    """This while loop loops through until no'bad duplicates' are left.
-    column - column with the value of interest
-    tolerance - acceptable % difference between value and average
-             ie.: if "[(value - mean)/mean*100]>tolerance" then remove data row
-    note: The mean is recalculated on each loop through to make sure it isn't skewed by the 'bad duplicate' values"""
+def average_and_remove_duplicates (column, tolerance, list_bad_duplicates,
+        data, max_stdev = 100000, compound_id='CMPD_NUMBER', 
+        rm_duplicate_only=False, smiles_col='rdkit_smiles_parent'):
+    """This while loop loops through until no 'bad duplicates' are left.
+
+    This function removes duplicates based on max_stdev and tolerance. If the
+    value in data[column] falls too far from the mean based on tolerance and
+    max_stdev then that entry is removed. This is repeated until all bad
+    entries are removed
+
+    Args:
+        column (str): column with the value of interest
+
+        tolerance (float): acceptable % difference between value and average
+            ie.: if "[(value - mean)/mean*100]>tolerance" then remove data row
+
+        list_bad_duplicates (str): 'Yes' to list the bad duplicates
+
+        data (DataFrame): input DataFrame
+
+        max_stdev (float): maximum standard deviation threshold
+
+        compound_id (str): column containing compound ids
+
+        rm_duplicate_only (bool): only remove bad duplicates, don't average good ones, the resulting table can be fed into aggregate assay data to further process.
+            note: The mean is recalculated on each loop through to make sure it isn't skewed by the 'bad duplicate' values
+
+        smiles_col (str): column containing base rdkit smiles strings
+
+    Returns:
+        DataFrame: Returns remaining rows after all bad duplicates have been removed.
+
+    """
 
     list_bad_duplicates = list_bad_duplicates
     i = 0
     bad_duplicates = 1
     removed = []
-    removed = pd.DataFrame(removed)
+    removed = pd.DataFrame(removed) 
 
     while i < 1 or bad_duplicates !=0 and not data.empty :
         #a. reset table if needed
@@ -387,7 +597,7 @@ def average_and_remove_duplicates (column, tolerance, list_bad_duplicates, data,
             del data['Remove_BadDuplicate']
 
         # 1. Calculate mean of duplicates
-        unique_smiles = data.groupby(smiles_col) 
+        unique_smiles = data.groupby(smiles_col)
         VALUE_NUM_mean = unique_smiles[column].mean()
         VALUE_NUM_std = unique_smiles[column].std()
         temporary_data = pd.concat([VALUE_NUM_mean,VALUE_NUM_std],axis=1)
@@ -402,7 +612,7 @@ def average_and_remove_duplicates (column, tolerance, list_bad_duplicates, data,
 
         # 4. Make removal recommendations
         data['Remove_BadDuplicate'] = np.where((data['Perc_Var']>tolerance),1,0)
-        data['Remove_BadDuplicate'] = np.where((data['VALUE_NUM_std']>max_stdev),1,0)
+        data['Remove_BadDuplicate'] = np.where((data['VALUE_NUM_std']>max_stdev),1, data.Remove_BadDuplicate.values)
 
         bad_duplicates = data['Remove_BadDuplicate'].max()  # 0 = no bad duplicates, 1 = bad duplicates
 
@@ -411,7 +621,7 @@ def average_and_remove_duplicates (column, tolerance, list_bad_duplicates, data,
         # 5. Remove bad duplicates
         data = data[data.Remove_BadDuplicate != 1]
 
-        removed = removed.append(to_remove)
+        removed = pd.concat([removed, to_remove])
         i = i+1
 
         # 6. If bad duplicates were removed, loop back to step 'a.' to reset table & re-calc. If no bad duplicates, exit 'while loop'.
@@ -428,18 +638,44 @@ def average_and_remove_duplicates (column, tolerance, list_bad_duplicates, data,
         print( removed[col])
 
     # retain only instance of each unique rdkit_smiles_parent
-    data = data.drop_duplicates(subset=smiles_col)
-
-    print("")
-    print("Dataset de-duplicated")
-    print("Dataframe size", data.shape[:])
-    print("New column created with averaged values: ", 'VALUE_NUM_mean')
+    if not rm_duplicate_only:
+        data = data.drop_duplicates(subset=smiles_col)
+        print("")
+        print("Dataset de-duplicated")
+        print("Dataframe size", data.shape[:])
+        print("New column created with averaged values: ", 'VALUE_NUM_mean')
 
     return data
 
 
 # ******************************************************************************************************************************************
 def summarize_data(column, num_bins, title, units, filepath, data, log_column = 'No'):
+    """Summarizes the in data[column]
+
+    Summarizes the data by printing mean, stdev, max, and min of the data. Creates
+    plots of the binned values in data[column]. If log_column != 'No' this also
+    creates plots that compares normal and log distributions of the data.
+
+    Args:
+        column (str): Column of interest.
+
+        num_bins (int): Number of bins in the histogram.
+
+        title (str): Title of the histogram.
+
+        units (str): Units for values in 'column'.
+
+        filepath (str): This file path gets printed to the console.
+
+        data (DataFrame): Input DataFrame.
+
+        log_column (str): Defaults to 'No'. Any other value will generate
+            a plot comparing normal and log distributions.
+
+    Returns:
+        None
+
+    """
 
     dataset_mean = data[column].mean()
     dataset_max = data[column].max()
@@ -495,6 +731,22 @@ def summarize_data(column, num_bins, title, units, filepath, data, log_column = 
 
 # ******************************************************************************************************************************************
 def create_new_rows_for_extra_results ( extra_result_col, value_col, data):
+    """Moves results from an extra column to an existing column
+
+    Returns a new DataFrame with values from 'extra_result_col' appended to the
+    end of 'value_col'. NaN values in 'extra_result_col' are dropped. 'Extra_result_col'
+    is dropped from the resulting DataFrame
+
+    Args:
+        extra_result_col (str): A column in 'data'.
+        
+        value_col (str): A column in 'data'.
+        
+        data (DataFrame):
+
+    Returns:
+        DataFrame
+    """
     addrows = data
     addrows = addrows.dropna(subset=[extra_result_col])
     addrows = addrows.drop(columns = value_col)
@@ -503,135 +755,32 @@ def create_new_rows_for_extra_results ( extra_result_col, value_col, data):
 
     return data
 
-
-# ******************************************************************************************************************************************
-# DEPRECATED - DeepChem only supports classification responses as non-negative indices 0, 1, 2. 
-# Use new function add_classification_column instead.
-def get_three_level_class(value, red_thresh, yellow_thresh):
-    """
-    Map a continuous value to a three level (green, yellow, red) classification in which intermediate ("yellow")
-    values are tagged with class -1. The idea is that these values will be removed from the data set.
-    """
-    if value >= red_thresh:
-        return 1
-    elif value < yellow_thresh:
-        return 0
-    else:
-        return -1
-
-# ******************************************************************************************************************************************
-# DEPRECATED. Use new function add_classification_column instead.
-def get_binary_class(value, thresh=4.0):
-    """
-    Map a continuous value to a binary classification by thresholding.
-    """
-    return int(value > thresh)
-
-# ******************************************************************************************************************************************
-# DEPRECATED - Use new function add_classification_column below
-def add_classification(low_limit, high_limit, source_column, data):
-    ''' this function is set up for 3-tier (low, med, high) and 2-tier (low, high) classification.
-        If low_limit and high_limit are equal, the 2-tier system will be utilized
-        low_limit = values below this limit are considered "low"
-        high_limit = values above this limit are considered "high"
-        source_column = the column heading of the values being compared against high/med/low criteria
-    '''
-
-    if low_limit != high_limit:
-        low = 0
-        medium = 1
-        high = 2
-        print('low=', low, ' medium=', medium, 'high=', high)
-    else:
-        low = 0
-        medium = 1
-        high = 1
-        print('low=', low, 'high=', high)
-
-    data['classification'] = np.where(data[source_column] < low_limit,low,"")
-    data['classification'] = np.where(data[source_column] >= low_limit,medium,data['classification'])
-    data['classification'] = np.where(data[source_column] >= high_limit,high,data['classification'])
-
-    return data
-
-# ******************************************************************************************************************************************
-# DEPRECATED. Use new function add_classification_column instead.
-# From Claire W: This new classification function is intended to replace the "add_classification" and perform all classification calcs needed. However,
-# the old function is being left in case other code is referencing/using it and doesn't want the extra column created
-
-# Kevin's comment: Need to allow caller to specify response column name, and generalize for arbitrary number of class labels.
-
-def add_binary_tertiary_classification(low_limit, high_limit, source_column, data):
-    ''' this function is set up for 3-tier (low, med, high) and 2-tier (low, high) classification.
-        If low_limit and high_limit are equal, the 2-tier system will be utilized
-        low_limit = values below this limit are considered "low"
-        high_limit = values above this limit are considered "high"
-        source_column = the column heading of the values being compared against high/med/low criteria
-    '''
-    
-    if low_limit != high_limit:  #give binary and tertiary classification
-        low = 0
-        medium = 1
-        high = 1        
-        print('Classification - binary')
-        print('low=', low, 'high=', high)         
-        data['class_binary'] = np.where(data[source_column] < low_limit,low,"")
-        data['class_binary'] = np.where(data[source_column] >= low_limit,medium,data['class_binary'])
-        data['class_binary'] = np.where(data[source_column] >= high_limit,high,data['class_binary'])        
-        print(data.groupby('class_binary').class_binary.count()) 
-        print("")
-        
-        low = 0
-        medium = 1
-        high = 2        
-        print('Classification - tertiary')
-        print('low=', low, ' medium=', medium, 'high=', high)
-        data['class_tertiary'] = np.where(data[source_column] < low_limit,low,"")
-        data['class_tertiary'] = np.where(data[source_column] >= low_limit,medium,data['class_tertiary'])
-        data['class_tertiary'] = np.where(data[source_column] >= high_limit,high,data['class_tertiary'])
-        print(data.groupby('class_tertiary').class_tertiary.count()) 
-        print("")
-        
-    else:  #binary only
-        low = 0
-        medium = 1
-        high = 1 
-        print('Classification - binary')
-        print('low=', low, 'high=', high)
-        data['class_binary'] = np.where(data[source_column] < low_limit,low,"")
-        data['class_binary'] = np.where(data[source_column] >= low_limit,medium,data['class_binary'])
-        data['class_binary'] = np.where(data[source_column] >= high_limit,high,data['class_binary'])
-        print(data.groupby('class_binary').class_binary.count()) 
-        print("")
-    
-    
-    return data
-
 # ******************************************************************************************************************************************
 # Generalized function to assign class labels based on thresholds on a continous value column.
 
 def add_classification_column(thresholds, value_column, label_column, data, right_inclusive=True):
-    """
-    Add a classification column 'label_column' to data frame 'data' based on values in 'value_column',
+    """Add a classification column to a DataFrame.
+
+    Add a classification column 'label_column' to DataFrame 'data' based on values in 'value_column',
     according to a sequence of thresholds. The number of classes is one plus the number of thresholds.
 
     Args:
         thresholds (float or sequence of floats): Thresholds to use to assign class labels. Label i will
-        be assigned to values such that thresholds[i-1] < value <= thresholds[i] (if right_inclusive is True)
-        or thresholds[i-1] <= value < thresholds[i] (otherwise).
-        
+            be assigned to values such that thresholds[i-1] < value <= thresholds[i] (if right_inclusive is True)
+            or thresholds[i-1] <= value < thresholds[i] (otherwise).
+
         value_column (str): Name of the column from which class labels are derived.
 
         label_column (str): Name of the new column to be created for class labels.
 
-        data (DataFrame): Data frame holding all data.
+        data (DataFrame): DataFrame holding all data.
 
         right_inclusive (bool): Whether the thresholding intervals are closed on the right or on the left.
-        Set this False to get the same behavior as add_binary_tertiary_classification. The default behavior
-        is preferred for the common case where the classification is based on a left-censoring threshold.
+            Set this False to get the same behavior as add_binary_tertiary_classification. The default behavior
+            is preferred for the common case where the classification is based on a left-censoring threshold.
 
     Returns:
-        data (DataFrame): Data frame updated to include class label column.
+        DataFrame: DataFrame updated to include class label column.
 
     """
 
@@ -656,11 +805,12 @@ def add_classification_column(thresholds, value_column, label_column, data, righ
 
 # ******************************************************************************************************************************************
 def xc50topxc50_for_nm(x) :
-   """
-   Convert XC50 values measured in nanomolars to -log10 (PX50)
+   """Convert XC50 values measured in nanomolars to -log10 (PX50)
+
    Args :
-     x: input XC50 value measured in nanomolars
+        x (float): input XC50 value measured in nanomolars
+
    Returns :
-       -log10 value of x
-   """	
+        float: -log10 value of x
+   """
    return -np.log10((x/1000000000.0))

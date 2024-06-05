@@ -13,14 +13,17 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   - [Mordred](#Mordred)
   - [Neural Networks](#Neural-Networks)
   - [Random Forests](#Random-Forests)
+  - [Hybrid model](#Hybrid-model)
   - [Splitting](#Splitting)
   - [Transformers](#Transformers)
   - [UMAP](#UMAP)
   - [XGBoost](#XGBoost)
+  - [Additional DeepChem Models](#Auto-DCModels)
 - [Model Saving](#Model-Saving)
 - [Model Metadata](#Model-Metadata)
 - [Miscellaneous](#Miscellaneous)
 - [Hyperparameter Optimization](#Hyperparameter-Optimization)
+  - [Bayesian Optimization](#Bayesian-Optimization)
 
 
 <a name="Training-Dataset-Parameters"></a>
@@ -78,7 +81,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|name of column(s) containing response values. Will default to last column if not specified. Input as a string of comma separated values for hyperparameter search. Can be input as a comma separated list for hyperparameter search (e.g. 'column1','column2')|
+|*Description:*|name of column(s) containing response values. Will default to last column if not specified. Can be input as a string of comma separated values or as a comma separated list (e.g. 'column1','column2'). Multitask models will be generated when multiple columns are specified.|
   
 - **save\_results**  
   
@@ -146,7 +149,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|User specified number of classes. TODO: Currently ingested in model\_wrapper, but unused.|
+|*Description:*|User specified number of classes. This is required for NN models but inferred for RF and XGBoost models.|
 |*Default:*|2|
 |*Type:*|int|
   
@@ -172,7 +175,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|dataset\_oid for the descriptor file in the datastore|
+|*Description:*|dataset\_oid for the descriptor file in the datastore. Specific to LLNL datastore system.|
   
 - **descriptor\_spec\_bucket**  
   
@@ -192,8 +195,9 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|Type of descriptors being used as features, e.g. moe, dragon7, used when featurizer = "descriptors". Sets the subclass within featurizer.py|
+|*Description:*|Type of descriptors being used as features, e.g. moe, dragon7, used when featurizer = "computed_descriptors". Sets the subclass within featurizer.py|
 |*Default:*|moe|
+|*Options:*|'moe', 'mordred_filtered', and 'rdkit_raw' are recommended. See atomsci/ddm/data/descriptor_sets_sources_by_descr_type.csv for more.|
   
 ---
 
@@ -238,7 +242,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|Type of model to fit (NN, RF, or xgboost). The model\_type sets the model subclass in model\_wrapper. Can be input as a comma separated list for hyperparameter search (e.g. 'NN','RF')|
+|*Description:*|Type of model to fit (NN, RF, or xgboost). The model\_type sets the model subclass in model\_wrapper. Can be input as a comma separated list for hyperparameter search (e.g. 'NN','RF','xgboost')|
 |*Type:*|str|
   
 - **prediction\_type**  
@@ -273,6 +277,16 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
 |*Default:*|FALSE|
 |*Type:*|Bool|
   
+- **production**  
+  
+|||
+|-|-|
+|*Description:*|True/False flag for training models in production mode. The entire dataset is used in training, validation, and test. If using training epocs
+the model will train for max_epochs regardless of validation error.|
+|*Default:*|FALSE|
+|*Type:*|Bool|
+  
+
 ---
 
 <a name="Graph-Convolution"></a>
@@ -402,6 +416,32 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 ---
 
+<a name="Hybrid-model"></a>
+## Hybrid model  
+
+- **is\_ki**  
+  
+|||
+|-|-|
+|*Description:*|True/False flag for noting whether the dose-response activity is Ki or XC50, if it is **True**, the following **ki_convert_ratio** is also needed to convert Ki into IC50 and to single concentration activity.|
+|*Default:*|False|
+  
+- **ki\_convert\_ratio**  
+  
+|||
+|-|-|
+|*Description:*|To convert Ki into IC50, a ratio is needed. It can be the ratio of \[S\]/Km for enzymatic inhibition assays, \[S\] is the concentration of substrate Km is the Michaelis constant. It can also be \[S\]/Kd for radioligand competitive binding, \[S\] is the concentration of the radioligand, Kd is its dissociation constant. The \[S\] and Kd/Km should have the same unit so that the ratio is unitless.|
+|*Default:*|None|
+  
+- **loss\_func**  
+  
+|||
+|-|-|
+|*Description:*|The loss function used in the hybrid model training, currently support poisson and l2|
+|*Default:*|poisson|
+  
+---
+
 <a name="Splitting"></a>
 ## Splitting  
 
@@ -485,9 +525,57 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|Type of splitter to use: index, random, scaffold, butina, ave\_min, temporal, fingerprint, or stratified. Used to set the splitting.py subclass. Can be input as a comma separated list for hyperparameter search (e.g. 'scaffold','random')|
+|*Description:*|Type of splitter to use: index, random, scaffold, butina, ave\_min, temporal, fingerprint, multitaskscaffold, or stratified. Used to set the splitting.py subclass. Can be input as a comma separated list for hyperparameter search (e.g. 'scaffold','random')|
 |*Default:*|scaffold|
 |*Type:*|str|
+  
+- **mtss\_num\_super\_scaffolds**  
+  
+|||
+|-|-|
+|*Description:*|This specifies the number of genes in a chromosome for the genetic algorithm. Scaffolds bins are often very small and only contain 1 compound. Scaffolds are therefore combined into super scaffolds to the number of genes and also reduce complexity and runtime.|
+|*Default:*|40|
+|*Type:*|int|
+
+- **mtss\_num\_generations**  
+  
+|||
+|-|-|
+|*Description:*|The number of generations the genetic algorithm will run.|
+|*Default:*|20|
+|*Type:*|int|
+
+- **mtss\_num\_pop**  
+  
+|||
+|-|-|
+|*Description:*|Size of population per generation in the genetic algorithm.|
+|*Default:*|100|
+|*Type:*|int|
+
+- **mtss\_train\_test\_dist\_weight**  
+  
+|||
+|-|-|
+|*Description:*|How much weight to give the tanimoto distance between training and test partitions.|
+|*Default:*|1.0|
+|*Type:*|float|
+
+- **mtss\_train\_valid\_dist\_weight**  
+  
+|||
+|-|-|
+|*Description:*|How much weight to give the tanimoto distance between training and valid partitions.|
+|*Default:*|1.0|
+|*Type:*|float|
+
+- **mtss\_split\_fraction\_weight**  
+  
+|||
+|-|-|
+|*Description:*|How much weight to give adherence to requested subset franctions.|
+|*Default:*|1.0|
+|*Type:*|float|
   
 ---
 
@@ -581,7 +669,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
 
 <a name="XGBoost"></a>
 ## XGBoost  
-
+- Currently, only `xgb_gamma` and `xgb_learning_rate` are supported for hyperparameter optimization.
 - **xgb\_colsample\_bytree**  
   
 |||
@@ -633,12 +721,52 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 ---
 
+<a name="Auto-DCModels"></a>
+## Additional DeepChem Models and Featurizers
+As of version 1.3 AMPL partially supports several DeepChem models. It is possible to train and predict
+using these models, but they are not currently integrated with the hyperparameter search wrapper.
+
+### Models
+AMPL supports the following models:
+
+- [AttentiveFPModel](https://deepchem.readthedocs.io/en/latest/api_reference/models.html#attentivefpmodel)
+- [GCNModel](https://deepchem.readthedocs.io/en/latest/api_reference/models.html#gcnmodel)
+- [GraphConvModel](https://deepchem.readthedocs.io/en/latest/api_reference/models.html#graphconvmodel)
+- [MPNNModel](https://deepchem.readthedocs.io/en/latest/api_reference/models.html#mpnnmodel)
+- [PytorchMPNNModel](https://deepchem.readthedocs.io/en/latest/api_reference/models.html#id38)
+
+
+These models can be selected by using the `model_type` paramter e.g. `"model_type":"AttentiveFPModel"`.
+Parameters for each model can be passed in by prefixing the parameter with the name of the model.
+
+```
+    "comment": "Model",
+    "comment": "----------------------------------------",
+    "model_type": "AttentiveFPModel",
+    "AttentiveFPModel_num_layers":"3",
+    "AttentiveFPModel_learning_rate": "0.0007",
+    "AttentiveFPModel_n_tasks": "1",
+```
+
+### Featurizers
+AMPL supports the following DeepChem featurizers:
+- [MolGraphConvFeaturizer](https://deepchem.readthedocs.io/en/latest/api_reference/featurizers.html#molgraphconvfeaturizer)
+- [WeaveFeaturizer](https://deepchem.readthedocs.io/en/latest/api_reference/featurizers.html#weavefeaturizer)
+- [ConvMolFeaturizer](https://deepchem.readthedocs.io/en/latest/api_reference/featurizers.html#convmolfeaturizer)
+
+Each DeepChem model expects a specific featurizer. Model/Featurizer compatibility is listed in [this table](https://deepchem.readthedocs.io/en/latest/api_reference/featurizers.html#convmolfeaturizer).
+Featurizers can be specified by setting the `featurizer` parameter. Featurizer parameters are passed
+in the same way as model parameters.
+
+```
+    "comment": "Features",
+    "comment": "----------------------------------------",
+    "featurizer":"MolGraphConvFeaturizer",
+    "MolGraphConvFeaturizer_use_edges":"True",
+```
+
 <a name="Model-Saving"></a>
 # Model Saving  
-
----
-
-##   
 
 - **collection\_name**  
   
@@ -729,7 +857,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|Number of tasks to run for. 1 means a singletask model, > 1 means a multitask model|
+|*Description:*|DEPRECATED AND IGNORED. This argument is now infered from the response_cols. Number of tasks to run for. 1 means a singletask model, > 1 means a multitask model|
 |*Default:*|1|
 |*Type:*|int|
   
@@ -767,7 +895,8 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|SLURM account to charge hyperparameter batch runs to. Specific to LLNL system.|
+|*Description:*|SLURM account to charge hyperparameter batch runs to. This will be replaced by the slurm\_account option. If lc\_account and slurm\_account are both set, slurm\_account will be used. If set to None then this parameter will not be used.|
+|*Default:*|baasic|
   
 - **max\_final\_layer\_size**  
   
@@ -803,14 +932,14 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
 |||
 |-|-|
 |*Description:*|Path to desired python version|
-|*Default:*|python|
+|*Default:*|This defaults to the Python instllation used to parse the JSON file. This is done by using sys.executable|
   
 - **rerun**  
   
 |||
 |-|-|
-|*Description:*|If False, check model tracker to see if a model with that particular param combination has already been built. Specific to hyperparameter search|
-|*Default:*|FALSE|
+|*Description:*| After parameter combos have been generated, `rerun=False` will check the model tracker to see if a model with a particular param combination has already been built. If it’s been built, do not create a new model or submit a slurm job. If `rerun=True`, the check will be skipped completely and a slurm job will be submitted regardless of whether a model has previously been built with these parameters. Specific to hyperparameter search.|
+|*Default:*|TRUE|
 |*Type:*|Bool|
   
 - **script\_dir**  
@@ -824,7 +953,7 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
   
 |||
 |-|-|
-|*Description:*|Type of hyperparameter search to do. Options = [grid, random, geometric, and user\_specified]|
+|*Description:*|Type of hyperparameter search to do. Options = [grid, random, geometric, hyperopt and user\_specified]|
 |*Default:*|grid|
   
 - **shortlist\_key**  
@@ -832,13 +961,50 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
 |||
 |-|-|
 |*Description:*|CSV file of assays of interest. Specific to LLNL model tracker system.|
+
+- **slurm\_account**  
+  
+|||
+|-|-|
+|*Description:*|SLURM account to charge hyperparameter batch runs to. This will replace the lc\_account option. If lc\_account and slurm\_account are both set, slurm\_account will be used. If set to None then this parameter will not be used.|
+|*Default:*|None|
+  
+- **slurm\_export**  
+  
+|||
+|-|-|
+|*Description:*|SLURM environment variables propagated for hyperparameter search batch jobs. If set to None then this parameter will not be used.|
+|*Default:*|ALL|
+  
+- **slurm\_nodes**  
+  
+|||
+|-|-|
+|*Description:*|Number of nodes for hyperparameter search batch jobs. If set to None then this parameter will not be used.|
+|*Default:*|1|
+|*Type:*|int|
+  
+- **slurm\_options**  
+  
+|||
+|-|-|
+|*Description:*|Additional SLURM options for hyperparameter search batch jobs. Example: '--option1=value1 --option2=value2'. If set to None then this parameter will not be used.|
+|*Default:*|None|
   
 - **slurm\_partition**  
   
 |||
 |-|-|
-|*Description:*|SLURM partition to urn hyperparameter batch runs on. Specific to LLNL model tracker system.|
+|*Description:*|SLURM partition to run hyperparameter batch runs on. If set to None then this parameter will not be used.|
 |*Default:*|pbatch|
+  
+- **slurm\_time\_limit**  
+  
+|||
+|-|-|
+|*Description:*|Time limit in minutes for hyperparameter search batch jobs.|
+|*Default:*|1440|
+|*Type:*|int|
   
 - **split\_only**  
   
@@ -856,3 +1022,75 @@ The AMPL pipeline contains many parameters and options to fit models and make pr
 |*Default:*|FALSE|
 |*Type:*|Bool|
   
+<a name="bayesian-optimization"></a>
+## Bayesian Optimization  
+
+- **lr**  
+  
+|||
+|-|-|
+|*Description:*|Learning rate searching domain in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `choice\|0.0001,0.0005,0.0002,0.001`. See https://github.com/ATOMScience-org/AMPL#hyperparameter-optimization|
+|*Default:*|None|
+
+- **dp**  
+  
+|||
+|-|-|
+|*Description:*|Dropouts searching domain in Bayesian Optimization. The format is `scheme\|num_layers\|parameters`, e.g. `uniform\|3\|0,0.4`, Note that the number of layers (number between two \|) can not be changed during optimization, if you want to try different number of layers, just run several optimizations.
+|*Default:*|None|
+
+- **ls**  
+  
+|||
+|-|-|
+|*Description:*|Layer sizes searching domain in Bayesian Optimization. The format is `scheme\|num_layers\|parameters`, e.g. `uniformint\|3\|8,512`, Note that the number of layers (number between two \|) can not be changed during optimization, if you want to try different number of layers, just run several optimizations.
+|*Default:*|None|
+
+- **rfe**  
+  
+|||
+|-|-|
+|*Description:*|Number of estimators searching domain of RF models in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `uniformint\|8,512`.
+|*Default:*|None|
+
+- **rfd**  
+  
+|||
+|-|-|
+|*Description:*|Max depth of the decision tree searching domain of RF models in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `uniformint\|8,512`.
+|*Default:*|None|
+
+- **rff**  
+  
+|||
+|-|-|
+|*Description:*|Max number of features searching domain of RF models in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `uniformint\|8,200`.
+|*Default:*|None|
+
+- **xgbg**  
+  
+|||
+|-|-|
+|*Description:*|xgb_gamma (Minimum loss reduction required to make a further partition on a leaf node of the tree) searching domain of XGBoost models in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `uniform\|0,0.4`.
+|*Default:*|None|
+
+- **xgbl**  
+  
+|||
+|-|-|
+|*Description:*|xgb_learning_rate (Boosting learning rate) searching domain of XGBoost models in Bayesian Optimization. The format is `scheme\|parameters`, e.g. `loguniform\|-6.9,-2.3`.
+|*Default:*|None|
+
+- **hp_checkpoint_save**  
+  
+|||
+|-|-|
+|*Description:*|binary file to save a checkpoint of the HPO trial project, which can be use to continue the HPO serach later.
+|*Default:*|None|c
+
+- **hp_checkpoint_load**  
+  
+|||
+|-|-|
+|*Description:*|binary file to load a checkpoint of a previous HPO trial project, to continue the HPO serach.
+|*Default:*|None|

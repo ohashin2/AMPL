@@ -1,630 +1,295 @@
+"""Functions for visualizing hyperparameter performance. These functions work with
+a dataframe of model performance metrics and hyperparameter specifications from
+compare_models.py. For models on the tracker, use get_multitask_perf_from_tracker().
+For models in the file system, use get_filesystem_perf_results().
+By Amanda P. 7/19/2022
 """
-Plotting routines for visualizing performance of models from hyperparameter search
-"""
-
-import os
-
-import matplotlib
-
-import sys
 import pandas as pd
+from pandas.api.types import CategoricalDtype
 import numpy as np
-import seaborn as sns
-import umap
-import sklearn.metrics as metrics
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from mpl_toolkits.mplot3d import Axes3D
+import seaborn as sns
+# Create an array with the colors you want to use
+colors = ["#7682A4","#A7DDD8","#373C50","#694691","#BE2369","#EB1E23","#6EC8BE","#FFC30F",]
+# Set your custom color palette
+pal=sns.color_palette(colors)
+sns.set_palette(pal)
 
+regselmets=[
+ 'r2_score',
+ 'mae_score',
+ 'rms_score',
+]
+classselmets = [
+ 'roc_auc_score',
+ 'prc_auc_score',
+ 'precision',
+ 'recall_score',
+ 'npv',
+ 'accuracy_score',
+ 'kappa',
+ 'matthews_cc',
+ 'bal_accuracy',
+]
 
-#matplotlib.style.use('ggplot')
-matplotlib.rc('xtick', labelsize=12)
-matplotlib.rc('ytick', labelsize=12)
-matplotlib.rc('axes', labelsize=12)
-sns.set(font_scale=1.1)
+def get_score_types():
+    """Helper function to show score type choices."""
+    print(classselmets)
+    print(regselmets)
 
+def _prep_perf_df(df):
+    """This function splits columns that contain lists into individual columns to
+    use for plotting later.
 
-#------------------------------------------------------------------------------------------------------------------------
-def hyper_perf_plots(collection='pilot_fixed', pred_type='regression', top_n=1, subset='test'):
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+    Returns:
+        perf_track_df (pd.DataFrame): a new df with modified and extra columns.
     """
-    Get results for models in the given collection. For each training dataset, separate the
-    results by model type and featurizer, and make a scatter plot of <subset> set r2_score vs
-    model type/featurizer combo. Then make plots of r2 vs model parameters relevant for each
-    model type.
+    perf_track_df=df.copy()
+    
+    if 'NN' in perf_track_df.model_type.unique():
+        perf_track_df['plot_dropout'] = perf_track_df.dropouts.astype(str).str.strip('[]').str.split(pat=',',n=1, expand=True)[0]
+        perf_track_df['plot_dropout'] = perf_track_df.plot_dropout.astype(float)
+        perf_track_df['layer_sizes'] = perf_track_df.layer_sizes.astype(str).str.strip('[]')
+        cols=['dummy_nodes_1','dummy_nodes_2','dummy_nodes_3']
+        tmp=perf_track_df.layer_sizes.str.split(pat=',', expand=True).astype(float)
+        n=len(tmp.columns)
+        perf_track_df[cols[0:n]]=tmp
+        perf_track_df['num_layers'] = n-perf_track_df[cols[0:n]].isna().sum(axis=1)
+        perf_track_df[cols[0:n]]=perf_track_df[cols[0:n]].fillna(value=1).astype(int)
+        perf_track_df['num_nodes']=perf_track_df[cols[0:n]].product(axis=1)
+        perf_track_df=perf_track_df.drop(columns=cols[0:n])
+        perf_track_df.loc[perf_track_df.model_type != "NN", 'layer_sizes']=np.nan
+        perf_track_df.loc[perf_track_df.model_type != "NN", 'num_layers']=np.nan
+        perf_track_df.loc[perf_track_df.model_type != "NN", 'num_nodes']=np.nan
+        perf_track_df.loc[perf_track_df.model_type != "NN", 'plot_dropout']=np.nan
+    
+    return perf_track_df
+
+def plot_train_valid_test_scores(df, scoretype='r2_score'):
+    """This function plots kde and line plots of performance scores based on their partitions.
+
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
     """
+    sns.set_context('poster')
+    perf_track_df=df.copy().reset_index(drop=True)
     
-    res_dir = '/usr/local/data/%s_perf' % collection
-    plt_dir = '%s/Plots' % res_dir
-    os.makedirs(plt_dir, exist_ok=True)
-    res_files = os.listdir(res_dir)
-    suffix = '_%s_model_perf_metrics.csv' % collection
-    feat_marker_map = {'descriptors' : 'o', 'ecfp' : 's', 'graphconv' : 'P'}
-    feat_model_marker_map = {'NN/descriptors' : 'o', 'NN/ecfp' : 's', 'RF/descriptors' : 'P', 'RF/ecfp': 'X'}
+    plot_df=perf_track_df[[f"best_train_{scoretype}",f"best_valid_{scoretype}",f"best_test_{scoretype}"]]
+    # turn off sorting if you have a ton of models.. can be slow
+    plot_df=plot_df.sort_values(f"best_valid_{scoretype}")
 
-    if pred_type == 'regression':
-        metric_type = 'r2_score'
-    else:
-        metric_type = 'roc_auc_score'
-    # TODO: Make these generic
-    green_red_pal = sns.blend_palette(['red', 'green'], 12, as_cmap=True)
-    mfe_pal = {'32/500' : 'red', '32/499' : 'blue', '63/300' : 'forestgreen', '63/499' : 'magenta'}
-    res_data = []
-    # Plot score vs learning rate for NN models
-    pdf_path = '%s/%s_%s_NN_perf_vs_learning_rate.pdf' % (plt_dir, collection, subset)
-    pdf = PdfPages(pdf_path)
-    for res_file in res_files:
-        try:
-            if not res_file.endswith(suffix):
-                print("File {} doesn't end with proper suffix".format(res_file))
-                continue
-            dset_name = res_file.replace(suffix, '')
-            res_path = os.path.join(res_dir, res_file)
-            res_df = pd.read_csv(res_path, index_col=False)
-            res_df['combo'] = ['%s/%s' % (m,f) for m, f in zip(res_df.model_type.values, res_df.featurizer.values)]
-            res_data.append(res_df)
-            nn_df = res_df[res_df.model_type == 'NN']
-            rf_df = res_df[res_df.model_type == 'RF']
-            fig = plt.figure(figsize=(10,13))
-            axes = fig.subplots(2,1,sharex=True)
-            ax1 = axes[0]
-            ax1.set_title('%s NN model perf vs learning rate' % dset_name, fontdict={'fontsize' : 12})
-            ax1.set_xscale('log')
-            sns.scatterplot(x='learning_rate', y='{0}_{1}'.format(metric_type, subset), hue='best_epoch', palette=green_red_pal,
-                            style='featurizer', markers=feat_marker_map, data=nn_df, ax=ax1)
-            ax2 = axes[1]
-            ax2.set_xscale('log')
-            sns.scatterplot(x='learning_rate', y='best_epoch', hue='best_epoch', palette=green_red_pal,
-                            style='featurizer', markers=feat_marker_map, data=nn_df, ax=ax2)
-            pdf.savefig(fig)
-        except:
-            continue
+    fig, ax = plt.subplots(1,2,figsize=(26,8))
+    sns.kdeplot(perf_track_df[f'best_train_{scoretype}'], label="train",ax=ax[0])
+    sns.kdeplot(perf_track_df[f'best_valid_{scoretype}'], label="valid",ax=ax[0])
+    sns.kdeplot(perf_track_df[f'best_test_{scoretype}'], label="test",ax=ax[0])
+    ax[0].set_xlabel(f'{scoretype}s')
 
-    pdf.close()
-    print("Wrote plots to %s" % pdf_path)
-    # Plot score vs max depth for RF models
-    pdf_path = '%s/%s_%s_RF_perf_vs_max_depth.pdf' % (plt_dir, collection, subset)
-    pdf = PdfPages(pdf_path)
-    for res_file in res_files:
-        try:
-            if not res_file.endswith(suffix):
-                continue
-            dset_name = res_file.replace(suffix, '')
-            res_path = os.path.join(res_dir, res_file)
-            res_df = pd.read_csv(res_path, index_col=False)
-            res_df['combo'] = ['%s/%s' % (m,f) for m, f in zip(res_df.model_type.values, res_df.featurizer.values)]
-            res_df['dataset'] = dset_name
-            res_df = res_df.sort_values('{0}_{1}'.format(metric_type, subset), ascending=False)
-            rf_df = res_df[res_df.model_type == 'RF']
-            fig = plt.figure(figsize=(8,8))
-            ax1 = fig.add_subplot(111)
-            rf_df['max_feat/estimators'] = ['%d/%d' % (mf,est) for mf,est in zip(rf_df.rf_max_features.values, rf_df.rf_estimators.values)]
-            ax1.set_title('%s RF model perf vs max depth' % dset_name, fontdict={'fontsize' : 12})
-            sns.scatterplot(x='rf_max_depth', y='{0}_{1}'.format(metric_type, subset), hue='max_feat/estimators', palette=mfe_pal, style='featurizer', markers=feat_marker_map, data=rf_df, ax=ax1)
-            pdf.savefig(fig)
-        except:
-            continue
-
-    pdf.close()
-    print("Wrote plots to %s" % pdf_path)
-
-    # Plot score vs model type and featurizer. Compile a table of top scoring model type/featurizers for each dataset.
-    pdf_path = '%s/%s_%s_perf_vs_model_type_featurizer.pdf' % (plt_dir, collection, subset)
-    pdf = PdfPages(pdf_path)
-
-    datasets = []
-    top_model_feat = []
-    top_scores = []
-    top_grouped_models = []
-    num_samples = []
-    top_combo_dsets = []
-    for res_file in res_files:
-        try:
-            if not res_file.endswith(suffix):
-                continue
-            dset_name = res_file.replace(suffix, '')
-            datasets.append(dset_name)
-            res_df['dataset'] = dset_name
-            print(dset_name)
-            res_df = res_df.sort_values('{0}_{1}'.format(metric_type, subset), ascending=False)
-            res_path = os.path.join(res_dir, res_file)
-            res_df = pd.read_csv(res_path, index_col=False)
-            res_df['model_type/feat'] = ['%s/%s' % (m,f) for m, f in zip(res_df.model_type.values, res_df.featurizer.values)]
-            res_df = res_df.sort_values('{0}_{1}'.format(metric_type, subset), ascending=False)
-            grouped_df = res_df.groupby('model_type/feat').apply(
-                lambda t: t.head(top_n)
-            ).reset_index(drop=True)
-            top_grouped_models.append(grouped_df)
-            top_combo = res_df['model_type/feat'].values[0]
-            top_combo_dsets.append(top_combo + dset_name.lstrip('ATOM_GSK_dskey'))
-            top_score = res_df['{0}_{1}'.format(metric_type, subset)].values[0]
-            top_model_feat.append(top_combo)
-            top_scores.append(top_score)
-            # Need to make sure which method works
-            #num_samples.append(res_df['Dataset Size'][0])
-            print(res_df['num_samples'])
-            num_samples.append(res_df['num_samples'])
-            fig = plt.figure(figsize=(8,10))
-            ax = fig.add_subplot(111)
-            ax.set_title('%s %s set perf vs model type and features' % (dset_name, subset), fontdict={'fontsize' : 10})
-            sns.scatterplot(x='model_type/feat', y='{0}_{1}'.format(metric_type, subset),
-                            style='featurizer', markers=feat_marker_map, data=res_df, ax=ax)
-            pdf.savefig(fig)
-        except Exception as e:
-            print("Couldn't get top combo")
-            print(e)
-            continue
-    pdf.close()
-    # Plot score vs model type and featurizer. Compile a table of top scoring model type/featurizers for each dataset.
-    try:
-        top_score_model_df = pd.DataFrame({'Dataset' : datasets, 'Top scoring model/features' : top_model_feat,
-                                           '{0} set {1}'.format(subset, metric_type) : top_scores,
-                                           'Dataset Size': num_samples, 'top_combo_dsets': top_combo_dsets})
-        top_score_model_df.to_csv('%s/%s_%s_top_scoring_models.csv' % (res_dir, collection, subset), index=False)
-        #TODO: working on adding in num_samples vs top r^2 plot
-        pdf_path = '%s/%s_%s_perf_vs_num_samples.pdf' % (plt_dir, collection, subset)
-        pdf = PdfPages(pdf_path)
-        fig = plt.figure(figsize=(10,9))
-        ax = fig.add_subplot(111)
-        ax.set_title('%s set perf vs number of compounds' % subset, fontdict={'fontsize' : 10})
-        # sns.scatterplot(x='Dataset Size', y='{0} set {1}'.format(subset, metric_type), style='top_combo_dsets',
-        #                data=top_score_model_df, ax=ax)
-        sns.scatterplot(x='Dataset Size', y='{0} set {1}'.format(subset, metric_type), data=top_score_model_df, ax=ax)
-        pdf.savefig(fig)
-        pdf.close()
-    except Exception as e:
-        print(e)
-        print("Can't get num samples info")
-    try:
-        combined_df = pd.concat(res_data, ignore_index=True)
-        combined_file = '%s/%s_%s_combined_data.csv' % (res_dir, collection, subset)
-        combined_df.to_csv(combined_file, index=False)
-        print("Wrote combined results table to %s" % combined_file)
-    except:
-        print("Can't get combined results")
-    try:
-        combined_df = pd.concat(top_grouped_models, ignore_index=True)
-        combined_df.to_csv('%s/%s_%s_top_scoring_models_grouped.csv' % (res_dir, collection, subset), index=False)
-        print("Wrote top grouped results table")
-    except:
-        print("Can't get grouped results")
+    ax[0].legend(loc="upper left")
+    ax[1].plot(plot_df.T);
+    ax[1].set_ylim(plot_df.min().min()-.1,1)
+    fig.suptitle(f"Model performance by partition");
 
     
-#------------------------------------------------------------------------------------------------------------------------
-def hyper_perf_plot_file(dset_name, col_name='pilot_fixed', pred_type='regression', top_n=1, subset='test'):
+### the following 3 plots are originally from Amanda M.
+def plot_rf_perf(df, scoretype='r2_score',subset='valid'):
+    """This function plots scatterplots of performance scores based on their RF hyperparameters.
+
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
+
+        subset (str): the subset of scores you'd like to plot from 'train', 'valid' and 'test'.
     """
-    Get results for models in the given collection. For each training dataset, separate the
-    results by model type and featurizer, and make a scatter plot of <subset> set r2_score vs
-    model type/featurizer combo. Then make plots of r2 vs model parameters relevant for each
-    model type.
-    """
-    res_dir = '/usr/local/data/%s_perf' % col_name
-    plt_dir = '%s/Plots' % res_dir
-    os.makedirs(plt_dir, exist_ok=True)
-    feat_marker_map = {'descriptors' : 'o', 'ecfp' : 's', 'graphconv' : 'P'}
-    if pred_type == 'regression':
-        metric_type = 'r2_score'
-    else:
-        metric_type = 'roc_auc_score'
-    # TODO: Make these generic
-    green_red_pal = sns.blend_palette(['red', 'green'], 12, as_cmap=True)
-    mfe_pal = {'32/500' : 'red', '32/499' : 'blue', '63/300' : 'forestgreen', '63/499' : 'magenta'}
-    suffix = '_%s_model_perf_metrics.csv' % col_name
-
-    print(dset_name)
-    res_file = '%s_%s_model_perf_metrics.csv' % (dset_name, col_name)
-    res_path = os.path.join(res_dir, res_file)
-    res_df = pd.read_csv(res_path, index_col=False)
-    print(res_df.keys())
-    res_df['combo'] = ['%s/%s' % (m,f) for m, f in zip(res_df.model_type.values, res_df.featurizer.values)]
-    res_df['dataset'] = dset_name
-    res_df = res_df.sort_values('{0}_{1}'.format(metric_type, subset), ascending=False)
-    nn_df = res_df[res_df.model_type == 'NN']
-    rf_df = res_df[res_df.model_type == 'RF']
-    # Plot score vs learning rate for NN models
+    sns.set_context('poster')
+    perf_track_df=df.copy().reset_index(drop=True)
+    plot_df=perf_track_df[perf_track_df.model_type=='RF']
+    winnertype= f'best_{subset}_{scoretype}'
     
-    pdf_path = '%s/%s_%s_%s_NN_perf_vs_learning_rate.pdf' % (plt_dir, col_name, dset_name, subset)
-    pdf = PdfPages(pdf_path)
-    try:
-        fig = plt.figure(figsize=(10,13))
-        axes = fig.subplots(2,1,sharex=True)
-        ax1 = axes[0]
-        ax1.set_title('%s NN model perf vs learning rate' % dset_name, fontdict={'fontsize' : 12})
-        ax1.set_xscale('log')
-        sns.scatterplot(x='learning_rate', y='{0}_{1}'.format(metric_type, subset), hue='best_epoch', palette=green_red_pal, style='featurizer', markers=feat_marker_map, data=nn_df, ax=ax1)
-        ax2 = axes[1]
-        ax2.set_xscale('log')
-        sns.scatterplot(x='learning_rate', y='best_epoch', hue='best_epoch', palette=green_red_pal,
-                        style='featurizer', markers=feat_marker_map, data=nn_df, ax=ax2)
-        pdf.savefig(fig)
-    except:
-        return
-
-    pdf.close()
-    print("Wrote plots to %s" % pdf_path)
-
-    # Plot score vs max depth for RF models
-    pdf_path = '%s/%s_%s_%s_RF_perf_vs_max_depth.pdf' % (plt_dir, col_name, dset_name, subset)
-    pdf = PdfPages(pdf_path)
-
-    try:
-        fig = plt.figure(figsize=(8,8))
-        ax1 = fig.add_subplot(111)
-        rf_df['max_feat/estimators'] = ['%d/%d' % (mf,est) for mf,est in zip(rf_df.rf_max_features.values, rf_df.rf_estimators.values)]
-        ax1.set_title('%s RF model perf vs max depth' % dset_name, fontdict={'fontsize' : 12})
-        sns.scatterplot(x='rf_max_depth', y='{0}_{1}'.format(metric_type, subset), hue='max_feat/estimators', palette=mfe_pal, style='featurizer', markers=feat_marker_map, data=rf_df, ax=ax1)
-
-        pdf.savefig(fig)
-    except:
-        return
-
-    pdf.close()
-    print("Wrote plots to %s" % pdf_path)
-
-    # Plot score vs model type and featurizer.
-    pdf_path = '%s/%s_%s_%s_perf_vs_model_type_featurizer.pdf' % (plt_dir, col_name, dset_name, subset)
-    pdf = PdfPages(pdf_path)
-    try:
-        res_df = pd.read_csv(res_path, index_col=False)
-        res_df['model_type/feat'] = ['%s/%s' % (m,f) for m, f in zip(res_df.model_type.values, res_df.featurizer.values)]
-        res_df = res_df.sort_values('{0}_{1}'.format(metric_type, subset), ascending=False)
-        fig = plt.figure(figsize=(8,10))
-        ax = fig.add_subplot(111)
-        ax.set_title('%s %s set perf vs model type and features' % (dset_name, subset), fontdict={'fontsize' : 10})
-        sns.scatterplot(x='model_type/feat', y='{0}_{1}'.format(metric_type, subset),
-                        style='featurizer', markers=feat_marker_map, data=res_df, ax=ax)
-        pdf.savefig(fig)
-    except:
-        return
-    pdf.close()
-    
-    #Compile a table of top scoring model type/featurizers for each dataset.
-    try:
-        top_model_feat = []
-        top_scores = []
-        print(res_df.shape)
-        grouped_df = res_df.groupby('model_type/feat').apply(
-            lambda t: t.head(top_n)
-        ).reset_index(drop=True)
-        grouped_dir = '%s/%s_%s_%s_top_scoring_models.csv' % (res_dir, col_name, dset_name, subset)
-        grouped_df.to_csv(grouped_dir, index=False)
-        print("Wrote top results table to %s" % grouped_dir)
-    except:
-        return
-
-# ------------------------------------------------------------------------------------------------------------------------
-def plot_uncertainties(results_df, col_name='pilot'):
-    """
-    Get results for models in the given collection. For each training dataset, separate the
-    results by model type and featurizer, and make a scatter plot of <subset> set r2_score vs
-    model type/featurizer combo. Then make plots of r2 vs model parameters relevant for each
-    model type.
-    """
-    res_dir = '/ds/projdata/gsk_data/model_analysis/'
-    plt_dir = '%s/Plots' % res_dir
-    os.makedirs(plt_dir, exist_ok=True)
-    '''
-    res_file = '%s_uncertainties.csv' % (col_name)
-    res_path = os.path.join(res_dir, res_file)
-    results_df = pd.read_csv(res_path, index_col=False)
-    '''
-    cats = results_df['dset_key'].unique()
-    cats.sort()
-    sns.set(font_scale=1.5)
-    model_type = results_df.model_type.values[0]
-    splitter = results_df.splitter.values[0]
-    plt_dir = '/usr/local/data/ddm_pipeline_paper/'
-    pdf_path = os.path.join(plt_dir, '%s_uncertainty_vs_error.pdf' % col_name)
-    pdf = PdfPages(pdf_path)
-    for dset_name in cats:
-        print(dset_name)
-        try:
-            fig = plt.figure(figsize=(10, 13))
-            ax = fig.add_subplot(111)
-            title_name = dset_name.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace(
-                'HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-            ax.set_title('%s std vs error for %s and %s split' % (title_name,
-                                                                  model_type,
-                                                                  splitter))
-            data = results_df[results_df.dset_key == dset_name]
-            std_col = [col for col in results_df.columns if 'std' in col][0]
-            actual_col = [col for col in results_df.columns if 'actual' in col][0]
-            g = sns.scatterplot(x="error", y=std_col, hue=actual_col, palette="YlOrRd", data=data, ax=ax)
-            ax.set(xlabel='Prediction error', ylabel='Uncertainty of prediction')
-            pdf.savefig(fig)
-        except Exception as e:
-            print(e)
-            continue
-    
-    pdf.close()
-    
-    pdf_path = '%s/%s_uncertainty_vs_pred.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for dset_name in cats:
-        print(dset_name)
-        try:
-            fig = plt.figure(figsize=(10, 13))
-            ax = fig.add_subplot(111)
-            title_name = dset_name.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace(
-                'HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-            ax.set_title('%s std vs error for %s and %s split' % (title_name,
-                                                                  model_type,
-                                                                  splitter))
-            data = results_df[results_df.dset_key == dset_name]
-            std_col = [col for col in results_df.columns if 'std' in col][0]
-            actual_col = [col for col in results_df.columns if 'actual' in col][0]
-            g = sns.scatterplot(x="error", y='pred', hue=actual_col, palette="YlOrRd", data=data, ax=ax)
-            ax.set(xlabel='Prediction error', ylabel='Predicted value')
-            pdf.savefig(fig)
-        except Exception as e:
-            print(e)
-            continue
-    
-    pdf.close()
-    
-    pdf_path = '%s/%s_uncertainty_vs_actual.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for dset_name in cats:
-        print(dset_name)
-        try:
-            fig = plt.figure(figsize=(10, 13))
-            ax = fig.add_subplot(111)
-            title_name = dset_name.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace(
-                'HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-            ax.set_title('%s std vs error for %s and %s split' % (title_name,
-                                                                  model_type,
-                                                                  splitter))
-            data = results_df[results_df.dset_key == dset_name]
-            std_col = [col for col in results_df.columns if 'std' in col][0]
-            actual_col = [col for col in results_df.columns if 'actual' in col][0]
-            g = sns.scatterplot(x="error", y='actual', hue='pred', palette="YlOrRd", data=data, ax=ax)
-            ax.set(xlabel='Prediction error', ylabel='Observed value')
-            pdf.savefig(fig)
-        except Exception as e:
-            print(e)
-            continue
-    
-    pdf.close()
-    
-    pdf_path = '%s/%s_predicted_actual_std.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for i, cat in enumerate(cats):
-        fig = plt.figure(figsize=(10, 13))
-        ax = fig.add_subplot(111)
-        title_name = cat.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace('HEK_IonWorks_Electrophys_2Hz_',
-                                                                               '').rstrip('.csv').replace('_', ' ')
-        ax.set_title('%s Predicted vs Actual for %s with %s split' % (title_name,
-                                                                      model_type,
-                                                                      splitter))
-        data = results_df[results_df.dset_key == cat]
-        std_col = [col for col in results_df.columns if 'std' in col][0]
-        actual_col = [col for col in results_df.columns if 'actual' in col][0]
-        predicted_col = [col for col in results_df.columns if 'pred' in col][0]
+    if len(plot_df)>0:
+        feat1 = 'rf_max_features'; feat2 = 'rf_max_depth'; feat3 = 'rf_estimators'
+        hue=feat3
         
-        g = sns.scatterplot(x=actual_col, y=predicted_col, hue=std_col, palette="YlOrRd", data=data, ax=ax,
-                            legend='brief')
-        g.legend().set_title('actual')
-        # replace labels
-        for t in g.legend().texts: t.set_text('std' if t.get_text() == 'std' else round(float(t.get_text()), 3))
-        ax.set(xlabel='Actual', ylabel='Predicted')
-        pdf.savefig(fig)
-    pdf.close()
-    
-    pdf_path = '%s/%s_uncertainties_error_bars.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for i, cat in enumerate(cats):
-        fig = plt.figure(figsize=(10, 13))
-        ax = fig.add_subplot(111)
-        df_sub = results_df[results_df['dset_key'] == cat]
-        title_name = cat.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace('HEK_IonWorks_Electrophys_2Hz_',
-                                                                               '').rstrip('.csv').replace('_', ' ')
-        ax.scatter(df_sub['actual'], df_sub['pred'], c=df_sub['std'], cmap='gray', marker='.')
-        ax.set_title('%s Predicted vs Actual for %s with %s split' % (title_name,
-                                                                      model_type,
-                                                                      splitter))
-        ax.set_xlabel('Actual')
-        ax.set_ylabel('Predicted')
-        # ax.set_xscale('log')
-        # ax.set_yscale('log')
-        eb = ax.errorbar(df_sub['actual'], df_sub['pred'], yerr=df_sub['std'], fmt='.')
-        # a, (b, c), (d,) = eb.lines
-        # d.set_color(col)
-        pdf.savefig(fig)
-    pdf.close()
+        plot_df = plot_df.sort_values([feat3, feat1, feat2])
+        plot_df[f'{feat1}/{feat2}'] = ['%s / %s' % (mf,est) for mf,est in zip(plot_df[feat1], plot_df[feat2])]
+        with sns.axes_style("whitegrid"):
+            fig = plt.figure(figsize=(40,15))
+            ax1 = fig.add_subplot(111)
+            sns.scatterplot(x=f'{feat1}/{feat2}', y=winnertype, hue=hue, palette=sns.cubehelix_palette(len(plot_df[hue].unique())), data=plot_df, ax=ax1)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+            plt.xticks(rotation=30, ha='right')
+            plt.title(f'RF model performance');
+    else: print("There are no RF models in this set.")
 
+        
+def plot_nn_perf(df, scoretype='r2_score',subset='valid'):
+    """This function plots scatterplots of performance scores based on their NN hyperparameters.
 
-# ------------------------------------------------------------------------------------------------------------------------
-'''
-def plot_uncertainties_binned(results_df, col_name='pilot'):
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
+
+        subset (str): the subset of scores you'd like to plot from 'train', 'valid' and 'test'.
     """
-    Get results for models in the given collection. For each training dataset, separate the
-    results by model type and featurizer, and make a scatter plot of <subset> set r2_score vs
-    model type/featurizer combo. Then make plots of r2 vs model parameters relevant for each
-    model type.
+    sns.set_context('poster')
+    perf_track_df=_prep_perf_df(df).reset_index(drop=True)
+    plot_df=perf_track_df[perf_track_df.model_type=='NN']
+    winnertype= f'best_{subset}_{scoretype}'
+    
+    if len(plot_df)>0:
+        feat1 = 'learning_rate'; feat2 = 'plot_dropout'; feat3 = 'layer_sizes'
+        hue=feat3
+        plot_df = plot_df.sort_values([feat3, feat1, feat2])
+        plot_df[f'{feat1}/{feat2}'] = ['%s / %s' % (mf,est) for mf,est in zip(plot_df[feat1], plot_df[feat2])]
+        with sns.axes_style("whitegrid"):
+            fig = plt.figure(figsize=(40,15))
+            ax1 = fig.add_subplot(111)
+            sns.scatterplot(x=f'{feat1}/{feat2}', y=winnertype, hue=hue, palette=sns.cubehelix_palette(len(plot_df[hue].unique())), data=plot_df, ax=ax1)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+            plt.xticks(rotation=30, ha='right')
+            plt.title(f'NN model performance');
+    else: print("There are no NN models in this set.")
+
+        
+def plot_xg_perf(df, scoretype='r2_score',subset='valid'):
+    """This function plots scatterplots of performance scores based on their XG hyperparameters.
+
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
+
+        subset (str): the subset of scores you'd like to plot from 'train', 'valid' and 'test'.
     """
-    res_dir = '/ds/projdata/gsk_data/model_analysis/'
-    plt_dir = '%s/Plots' % res_dir
-    os.makedirs(plt_dir, exist_ok=True)
-    res_file = '%s_uncertainties.csv' % (col_name)
-    res_path = os.path.join(res_dir, res_file)
-    results_df = pd.read_csv(res_path, index_col=False)
-    cats = results_df['dset_key'].unique()
-    cats.sort()
-    sns.set(font_scale=1.5)
-    model_type = results_df.model_type.values[0]
-    splitter = results_df.splitter.values[0]
-    pdf_path = '%s/%s_uncertainty_plots.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for dset_name in cats:
-        print(dset_name)
-        for model_type in ['NN', 'RF']:
-            for splitter in ['scaffold','random']:
-                #data = results_df[(results_df.dset_key == dset_name) & (results_df.model_type == model_type) & (results_df.splitter == splitter)]
-                data = results_df[results_df.dset_key == dset_name]
-                try:
-                    fig = plt.figure(figsize=(10,13))
-                    ax = fig.add_subplot(111)
-                    title_name = dset_name.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace('HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-                    ax.set_title('%s std vs error' % (title_name))
-                    std_col = [col for col in results_df.columns if 'std' in col][0]
-                    actual_col = [col for col in results_df.columns if 'actual' in col][0]
-                    g = sns.distplot(data, columns=[x="error", y=std_col, bins=5, hue=actual_col, palette="YlOrRd", data=data, ax=ax, legend='brief')
-                    ax.set(xlabel='Binned prediction error', ylabel='Uncertainty of prediction')
-                    pdf.savefig(fig)
-                except Exception as e:
-                    print(e)
-                    continue
+    sns.set_context('poster')
+    perf_track_df=df.copy().reset_index(drop=True)
+    plot_df=perf_track_df[perf_track_df.model_type=='xgboost']
+    winnertype= f'best_{subset}_{scoretype}'
+    if len(plot_df)>0:
+        feat1 = 'xgb_learning_rate'; feat2 = 'xgb_gamma'
+        hue=feat2
+        plot_df = plot_df.sort_values([feat1, feat2])
+        #plot_df[f'{feat1}/{feat2}'] = ['%s / %s' % (mf,est) for mf,est in zip(plot_df[feat1], plot_df[feat2])]
+        with sns.axes_style("whitegrid"):
+            fig = plt.figure(figsize=(40,15))
+            ax1 = fig.add_subplot(111)
+            sns.scatterplot(x=feat1, y=winnertype, 
+                            hue=hue, palette=sns.cubehelix_palette(len(plot_df[hue].unique())), 
+                            data=plot_df, ax=ax1)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+            plt.xticks(rotation=30, ha='right')
+            plt.title(f'XGboost model performance');
+    else: print('There are no XGBoost models in this set.')
 
-    pdf.close()
+        
+def plot_rf_nn_xg_perf(df, scoretype='r2_score',subset='valid'):
+    """This function plots boxplots of performance scores based on their hyperparameters including
+    RF, NN and XGBoost parameters as well as feature types, model types and ECFP radius.
 
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
 
-    pdf_path = '%s/%s_predicted_actual_std.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for i,cat in enumerate(cats):
-        fig = plt.figure(figsize=(10,13))
-        ax = fig.add_subplot(111)
-        title_name = cat.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace('HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-        ax.set_title('%s Predicted vs Actual for %s with %s split' % (title_name,
-                                                              model_type,
-                                                              splitter))
-        data = results_df[results_df.dset_key == cat]
-        std_col = [col for col in results_df.columns if 'std' in col][0]
-        actual_col = [col for col in results_df.columns if 'actual' in col][0]
-        predicted_col = [col for col in results_df.columns if 'pred' in col][0]
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
 
-        g = sns.scatterplot(x=actual_col, y=predicted_col, hue=std_col, palette="YlOrRd", data=data, ax=ax, legend='brief')
-        g.legend().set_title('actual')
-        # replace labels
-        for t in g.legend().texts: t.set_text('std' if t.get_text() == 'std' else round(float(t.get_text()), 3))
-        ax.set(xlabel='Actual', ylabel='Predicted')
-        pdf.savefig(fig)
-        pdf.savefig(fig)
-    pdf.close()
-
-    pdf_path = '%s/%s_uncertainties_error_bars.pdf' % (plt_dir, col_name)
-    pdf = PdfPages(pdf_path)
-    for i,cat in enumerate(cats):
-        fig = plt.figure(figsize=(10,13))
-        ax = fig.add_subplot(111)
-        df_sub = results_df[results_df['dset_key'] == cat]
-        title_name = cat.split('/')[-1].replace('dskey_ATOM_GSK_', '').replace('HEK_IonWorks_Electrophys_2Hz_', '').rstrip('.csv').replace('_', ' ')
-        ax.scatter(df_sub['actual'], df_sub['pred'], c=df_sub['std'], cmap='gray', marker='.')
-        ax.set_title('%s Predicted vs Actual for %s with %s split' % (title_name,
-                                                                              model_type,
-                                                                              splitter))
-        ax.set_xlabel('Actual')
-        ax.set_ylabel('Predicted')
-        #ax.set_xscale('log')
-        #ax.set_yscale('log')
-        eb = ax.errorbar(df_sub['actual'], df_sub['pred'], yerr=df_sub['std'], fmt='.')
-        #a, (b, c), (d,) = eb.lines
-        #d.set_color(col)
-        pdf.savefig(fig)
-    pdf.close()
-    '''
+        subset (str): the subset of scores you'd like to plot from 'train', 'valid' and 'test'.
+    """
+    sns.set_context('paper')
+    perf_track_df=_prep_perf_df(df).reset_index(drop=True)
+    winnertype= f'best_{subset}_{scoretype}'
     
-#------------------------------------------------------------------------------------------------------------------------
-def plot_timings(timings_file, out_dir):
-    timings_df = pd.read_csv(timings_file)
-    timings_df = timings_df.drop(timings_df['run_time'].idxmax())
-    timings_df = timings_df.drop(timings_df['run_time'].idxmax())
-    timings_df['layer_info'] = timings_df['layer_sizes'] + ' ' + timings_df['dropouts']
-    def get_params(row):
-        if row['model_type'] == 'RF' or row['featurizer'] == 'graphconv':
-            return 0
-        ls = [row['num_samples']]
-        #ls = [1]
-        if type(row['layer_sizes']) != str:
-            return 0
-        ls.extend(row['layer_sizes'].strip('[').strip(']').split(','))
-        ls.append(1)
-        ls = [int(l) for l in ls]
-        return int(sum([(x+1)*y for x,y in list(zip(ls[:-1], ls[1:]))]))
-    timings_df['num_params'] = timings_df.apply(get_params, axis=1)
-    timings_df['log_num_params'] = timings_df['num_params'].apply(np.log)
-    timings_df['model_feat'] = timings_df["featurizer"] + '_' + timings_df["model_type"]
-    timings_df['run_time/cpds'] = timings_df['run_time'].map(float)/timings_df['num_samples'].map(float)
-
-    sns_plot =sns.scatterplot(x='num_samples', y='run_time', data=timings_df, hue='model_feat', legend='brief')
-    sns_plot.set_xlabel('Number of Compounds')
-    sns_plot.set_ylabel('Runtime')
-    handles, labels = sns_plot.get_legend_handles_labels()
-    sns_plot.legend(handles=handles[1:], labels=labels[1:])
-    sns_plot.figure.savefig(os.path.join(out_dir, 'runtime_num_compounds.pdf'))
-
-    sns_plot = sns.catplot(x="model_type", y="run_time", data=timings_df, height=8, hue='num_samples', legend='brief')
-    sns_plot.set_xlabels('Model Type')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_model_type.pdf'))
-
-    sns_plot = sns.catplot(x="featurizer", y="run_time", data=timings_df, height=8, hue='num_samples', legend='brief')
-    sns_plot.set_xlabels('Featurizer + Model Type')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_feat.pdf'))
-
-    sns_plot = sns.catplot(x="model_feat", y="run_time", data=timings_df, height=15, hue='num_samples', legend='brief')
-    sns_plot.set_xlabels('Featurizer + Model Type')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_model_feat.pdf'))
-
-    sns_plot = sns.catplot(x="layer_sizes", y="run_time", data=timings_df, height=15, hue='featurizer', legend='brief')
-    sns_plot.set_xlabels('Layer architecture')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_layer_size.pdf'))
-
-    sns_plot = sns.catplot(x="dropouts", y="run_time", data=timings_df, height=12, hue='featurizer', legend='brief')
-    sns_plot.set_xlabels('Dropout probabilities')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_dropouts.pdf'))
-
-
-    sns_plot = sns.catplot(x="layer_info", y="run_time", data=timings_df, height=15,hue='featurizer', legend='brief')
-    sns_plot.set_xticklabels(rotation=60)
-    sns_plot.set_xlabels('Layer architecture + dropout probabilities')
-    sns_plot.set_ylabels('Runtime')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_layer_dropouts.pdf'))
-
-    sns_plot =sns.scatterplot(x='log_num_params', y='run_time', data=timings_df[timings_df['num_params'] != np.NaN], hue='model_feat', legend='brief')
-    sns_plot.set_xlabel('log(number of parameters)')
-    sns_plot.set_ylabel('Runtime')
-    handles, labels = sns_plot.get_legend_handles_labels()
-    sns_plot.legend(handles=handles[1:3], labels=labels[1:3])
-    sns_plot.figure.savefig(os.path.join(out_dir, 'runtime_num_params.pdf'))
+    nfeats=3
+    feat1='plot_dropout'; feat2='learning_rate'; feat3='num_nodes'
+    feat4='num_layers'; feat5='rf_max_depth'; feat6='rf_max_features'
+    feat7='rf_estimators'; feat8='xgb_gamma'; feat9='xgb_learning_rate'
+    feat10='features'; feat11='model_type'; feat12=f'best_test_{scoretype}'; feat13='ecfp_radius'
     
-    sns_plot = sns.catplot(x="model_type", y="run_time/cpds", data=timings_df, height=8, hue='num_samples', legend='brief')
-    sns_plot.set_xlabels('Model Type')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_model_type.pdf'))
+    plotdf2=perf_track_df
+    fig, ax = plt.subplots(4,3, figsize=(16,12))
+    if 'NN' in perf_track_df.model_type.unique():
+        sns.boxplot(x=feat1, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat1].unique()), rot=0, start=0.40), data=plotdf2,    ax=ax[0,0]); ax[0,0].tick_params(rotation=0);  ax[0,0].set_xlabel('NN dropouts')
+        sns.boxplot(x=feat2, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat2].unique()), rot=0, start=0.40), data=plotdf2,    ax=ax[0,1]); ax[0,1].tick_params(rotation=30); ax[0,1].set_xlabel('NN learning rate')#ax[0,1].legend_.remove(); ax[0,1].title.set_text(f"Hyperparameters colored by {feat1}")
+        plotdf=perf_track_df[perf_track_df[feat3]>0]
+        sns.boxplot(x=feat3, y=winnertype, palette=sns.cubehelix_palette(len(plotdf[feat3].unique()), rot=0, start=0.40), data=plotdf,    ax=ax[0,2]); ax[0,2].tick_params(rotation=30); ax[0,2].set_xlabel('NN number of parameters in hidden layers')#ax[0,2].legend_.remove()#(bbox_to_anchor=(1,1), title=feat1)#, prop={'size': 12})
+        sns.boxplot(x=feat4, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat4].unique()), rot=0, start=0.40), data=plotdf2,    ax=ax[1,0]); ax[1,0].tick_params(rotation=0);  ax[1,0].set_xlabel('NN number of layers')#ax[1,0].legend_.remove(); ax[1,0].tick_params(rotation=45)
+    if 'xgboost' in perf_track_df.model_type.unique():
+        sns.boxplot(x=feat8, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat8].unique()), rot=0, start=2.75), data=plotdf2,    ax=ax[1,1]); ax[1,1].tick_params(rotation=0);  ax[1,1].set_xlabel('XGBoost gamma')#ax[1,1].title.set_text(f"Hyperparameters colored by {feat2}")
+        sns.boxplot(x=feat9, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat9].unique()), rot=0, start=2.75), data=plotdf2,    ax=ax[1,2]); ax[1,2].tick_params(rotation=0);  ax[1,2].set_xlabel('XGBoost learning rate')#ax[1,2].legend_.remove()#(bbox_to_anchor=(1,1), title=feat2)
+    if 'RF' in perf_track_df.model_type.unique():
+        sns.boxplot(x=plotdf2.loc[~plotdf2[feat7].isna(),feat7].astype(int), y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat7].unique()), rot=0, start=2.00), data=plotdf2,    ax=ax[2,0]); ax[2,0].tick_params(rotation=0); ax[2,0].set_xlabel('RF number of trees')#ax[2,0].legend_.remove(); ax[2,0].tick_params(rotation=45)
+        try:
+            sns.boxplot(x=plotdf2.loc[~plotdf2[feat5].isna(),feat5].astype(int), y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat5].unique()), rot=0, start=2.00), data=plotdf2,    ax=ax[2,1]); ax[2,1].tick_params(rotation=0)
+        except: pass
+        ax[2,1].set_xlabel('RF max depth')#ax[2,1].legend_.remove(); ax[2,1].title.set_text(f"Hyperparameters colored by {feat3}")
+        sns.boxplot(x=plotdf2.loc[~plotdf2[feat6].isna(),feat6].astype(int), y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat6].unique()), rot=0, start=2.00), data=plotdf2,    ax=ax[2,2]); ax[2,2].tick_params(rotation=0); ax[2,2].set_xlabel('RF max features per node')#ax[2,2].legend(bbox_to_anchor=(1,1), title=feat3);
+    #general
+    plotdf2=plotdf2.sort_values(feat10)
+    sns.boxplot(x=feat10, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat10].unique()), rot=60, start=0.20), data=plotdf2,  ax=ax[3,0]); ax[3,0].tick_params(rotation=0);  ax[3,0].set_xlabel('Featurization type');ax[3,0].set_xticklabels( ax[3,0].get_xticklabels(), rotation=30, ha='right', rotation_mode='anchor' )#ax[2,0].legend_.remove(); 
+    sns.boxplot(x=feat11, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat11].unique()), rot=60, start=0.20), data=plotdf2,  ax=ax[3,1]); ax[3,1].tick_params(rotation=0);  ax[3,1].set_xlabel('Model type')#ax[2,1].legend_.remove(); ax[2,1].title.set_text(f"Hyperparameters colored by {feat3}")
+    if 'ecfp_radius' in perf_track_df.columns:
+        sns.boxplot(x=feat13, y=winnertype, palette=sns.cubehelix_palette(len(plotdf2[feat13].unique()), rot=60, start=0.20), data=plotdf2,  ax=ax[3,2])
+    ax[3,2].tick_params(rotation=0);  ax[3,2].set_xlabel('ECFP radius')#ax[2,1].legend_.remove(); ax[2,1].title.set_text(f"Hyperparameters colored by {feat3}")
+    # sns.scatterplot(x=feat12, y=winnertype,palette=sns.cubehelix_palette(len(plotdf2[feat12].unique()),rot=0, start=0.20),data=plotdf2, ax=ax[3,2]); ax[3,2].tick_params(rotation=0);  ax[3,2].set_xlabel(f'{feat12}')#ax[2,2].legend(bbox_to_anchor=(1,1), title=feat3);
 
-    sns_plot = sns.catplot(x="featurizer", y="run_time/cpds", data=timings_df, height=8, legend='brief')
-    sns_plot.set_xlabels('Featurizer')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_feat.pdf'))
+    plt.tight_layout()
+    fig.suptitle(f"Effect of hyperparameter tuning on model performance", y=1.01);
 
-    sns_plot = sns.catplot(x="model_feat", y="run_time/cpds", data=timings_df, height=15, legend='brief')
-    sns_plot.set_xlabels('Featurizer + Model Type')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_model_feat.pdf'))
-
-    sns_plot = sns.catplot(x="layer_sizes", y="run_time/cpds", data=timings_df, height=15, hue='model_feat', legend='brief')
-    sns_plot.set_xlabels('Layer architecture')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_layer_size.pdf'))
-
-    sns_plot = sns.catplot(x="dropouts", y="run_time/cpds", data=timings_df, height=12, hue='model_feat', legend='brief')
-    sns_plot.set_xlabels('Dropout probabilities')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_dropouts.pdf'))
-
-    sns_plot = sns.catplot(x="layer_info", y="run_time/cpds", data=timings_df, height=15,hue='model_feat', legend='brief')
-    sns_plot.set_xticklabels(rotation=60)
-    sns_plot.set_xlabels('Layer architecture + dropout probabilities')
-    sns_plot.set_ylabels('Runtime/Number of Compounds')
-    sns_plot.savefig(os.path.join(out_dir, 'runtime_cpds_layer_dropouts.pdf'))
     
-    sns_plot =sns.scatterplot(x='log_num_params', y='run_time/cpds', data=timings_df[timings_df['num_params'] != np.NaN], hue='model_feat', legend='brief')
-    sns_plot.set_xlabel('log(number of parameters)')
-    sns_plot.set_ylabel('Runtime/Number of Compounds')
-    handles, labels = sns_plot.get_legend_handles_labels()
-    sns_plot.legend(handles=handles[1:3], labels=labels[1:3])
-    sns_plot.figure.savefig(os.path.join(out_dir, 'runtime_cpds_num_params.pdf'))
-    
+def plot_split_perf(df, scoretype='r2_score',subset='valid'):
+    """This function plots boxplots of performance scores based on the splitter type.
+
+    Args:
+        df (pd.DataFrame): A dataframe containing model performances from a
+        hyperparameter search. Best practice is to use get_multitask_perf_from_tracker() or
+        get_filesystem_perf_results().
+
+        scoretype (str): the score type you want to use. Valid options can be found in
+        hpp.classselmets or hpp.regselmets.
+
+        subset (str): the subset of scores you'd like to plot from 'train', 'valid' and 'test'.
+    """
+    sns.set_style("ticks")
+    sns.set_context("paper")    
+    perf_track_df=_prep_perf_df(df).reset_index(drop=True)
+    winnertype= f'best_{subset}_{scoretype}'
+
+    if scoretype in regselmets:
+        selmets=regselmets
+    elif scoretype in classselmets:
+        selmets=classselmets
+        
+    plot_df=perf_track_df
+    plot_df=plot_df.sort_values('features')
+    fig, axes = plt.subplots(1,len(selmets), figsize=(5*len(selmets),5))
+    for i, ax in enumerate(axes.flat):
+        selection_metric = f'best_{subset}_{selmets[i]}'
+        g=sns.boxplot(x="features", y=selection_metric, # x="txptr_features" x="model_type"
+                    hue='splitter', palette = sns.color_palette(colors), #showfliers=False, 
+                    data=plot_df, ax=ax);
+        g.set_xlabel('')
+        g.set_ylabel(selection_metric.replace('best_valid_',''))
+        g.set_xticklabels( g.get_xticklabels(), rotation=30, ha='right', rotation_mode='anchor' )
+    plt.tight_layout()
+    fig.suptitle('Effect of splitter on model performance', y=1.01)

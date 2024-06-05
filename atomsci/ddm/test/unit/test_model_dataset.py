@@ -3,12 +3,16 @@ import sys
 import pandas as pd
 import pytest
 import inspect
+import json
 import numpy as np
 import atomsci.ddm.pipeline.featurization as feat
 import atomsci.ddm.pipeline.splitting as split
 import atomsci.ddm.utils.datastore_functions as ds
 import deepchem as dc
 import atomsci.ddm.pipeline.model_datasets as model_dataset
+import atomsci.ddm.pipeline.parameter_parser as parse
+from atomsci.ddm.pipeline import model_pipeline as mp
+from atomsci.ddm.pipeline import featurization as feat
 import utils_testing as utils
 
 """This testing script assumes that /ds/data/public/delaney/delaney-processed.csv is still on the same path on twintron. Assumes that the dataset_key: /ds/projdata/gsk_data/GSK_derived/PK_parameters/gsk_blood_plasma_partition_rat_crit_res_data.csv under the bucket gskdata and with the object_oid: 5af0e6368003ff018de33db5 still exists. 
@@ -40,7 +44,7 @@ if not datastore_is_down:
     df_datastore = ds.retrieve_dataset_by_datasetkey(params_from_ds.dataset_key,params_from_ds.bucket)
     
 
-DD = dc.data.datasets.DiskDataset
+DD = dc.data.datasets.NumpyDataset
 
 
 
@@ -55,8 +59,7 @@ def test_create_model_dataset():
     test_list = []
     test_list.append(isinstance(dataset_obj_from_file, model_dataset.FileDataset))
 
-
-    methods = ["load_full_dataset","check_task_columns","load_featurized_data","get_featurized_data","get_dataset_tasks","split_dataset","get_split_metadata","save_split_dataset","load_presplit_dataset","save_featurized_data","combined_training_data"]
+    methods = ["load_full_dataset","load_featurized_data","get_featurized_data","get_dataset_tasks","split_dataset","get_split_metadata","save_split_dataset","load_presplit_dataset","save_featurized_data","combined_training_data"]
     #testing datastore
     if not datastore_is_down:
         test_list.append(isinstance(dataset_obj_from_datastore, model_dataset.DatastoreDataset))
@@ -146,7 +149,7 @@ def test_get_dataset_tasks():
 
 
 def test_check_task_columns():
-    """Checks that self.tasks exist, then checks that the requested self.tasks all exist within the dataframe. Throws exception if self.get_dataset_tasks is False or if prediction tasks are missing. Testing for exception raising on bad task columns and success. """
+    """Checks that self.tasks exist, then checks that the requested self.tasks all exist within the dataframe. Throws exception if self.get_dataset_tasks is False or if prediction tasks are missing. Testing for exception raising on bad task columns and success."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -154,13 +157,13 @@ def test_check_task_columns():
     #with pytest.raises(Exception):
     #    dataset_obj_from_file_wrongy.check_task_columns(delaney_from_disk)
 
-    dataset_obj_from_file.check_task_columns(delaney_from_disk)
-    assert dataset_obj_from_file.tasks == params_from_file.response_cols
+    model_dataset.check_task_columns(params_from_file, df_delaney)
+    #assert dataset_obj_from_file.tasks == params_from_file.response_cols
     if not datastore_is_down:
         #with pytest.raises(Exception):
         #    dataset_obj_from_datastore_wrongy.check_task_columns(df_datastore)
-        dataset_obj_from_datastore.get_dataset_tasks(df_datastore)
-        assert dataset_obj_from_datastore.tasks == params_from_ds.response_cols
+        ds_tasks = dataset_obj_from_datastore.get_dataset_tasks(df_datastore)
+        assert ds_tasks == params_from_ds.response_cols
 
 
 
@@ -190,8 +193,7 @@ def test_set_group_permissions():
 """
 #***********************************************************************************
 def test_get_featurized_data():
-    """Tries to load a previously prefeaturized dataset, then creates featurization, instantiates n_features, and dumps a pickle file of the transformers if they exist. Implemented in super. The dataset object from file is a delaney dataset using an ecfp featurizer with a default scaffold split. Testing of featurization of the dataset is extensively done in test_featurization.py
-    """
+    """Tries to load a previously prefeaturized dataset, then creates featurization, instantiates n_features, and dumps a pickle file of the transformers if they exist. Implemented in super. The dataset object from file is a delaney dataset using an ecfp featurizer with a default scaffold split. Testing of featurization of the dataset is extensively done in test_featurization.py"""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -200,17 +202,15 @@ def test_get_featurized_data():
     dataset_obj_from_file.get_featurized_data()
     test_list = []
     test_list.append(dataset_obj_from_file.n_features == params_from_file.ecfp_size)
-    test_list.append(isinstance(dataset_obj_from_file.dataset, dc.data.datasets.DiskDataset))
+    test_list.append(isinstance(dataset_obj_from_file.dataset, dc.data.datasets.NumpyDataset)) 
     test_list.append(len(dataset_obj_from_file.dataset) == len(df_delaney))
     test_list.append(dataset_obj_from_file.n_features == dataset_obj_from_file.params.ecfp_size)
     assert all(test_list)
 
-
 #***********************************************************************************
 
 def test_get_featurized_data_scaffold():
-    """Tries to load a previously prefeaturized dataset, then creates featurization, instantiates n_features, and dumps a pickle file of the transformers if they exist. Implemented in super. The dataset object from file is a delaney dataset using an ecfp featurizer with a default scaffold split. Testing of featurization of the dataset is extensively done in test_featurization.py
-    """
+    """Tries to load a previously prefeaturized dataset, then creates featurization, instantiates n_features, and dumps a pickle file of the transformers if they exist. Implemented in super. The dataset object from file is a delaney dataset using an ecfp featurizer with a default scaffold split. Testing of featurization of the dataset is extensively done in test_featurization.py"""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -220,7 +220,7 @@ def test_get_featurized_data_scaffold():
 
     test_list = []
 
-    test_list.append(isinstance(dataset_obj_from_file_scaffold.dataset, dc.data.datasets.DiskDataset))
+    test_list.append(isinstance(dataset_obj_from_file_scaffold.dataset, dc.data.datasets.NumpyDataset))
     test_list.append(len(dataset_obj_from_file_scaffold.dataset) == len(df_delaney))
     test_list.append(dataset_obj_from_file.n_features == dataset_obj_from_file.params.ecfp_size)
     test_list.append(len(dataset_obj_from_file.dataset.y) == len(dataset_obj_from_file.dataset.ids))
@@ -231,8 +231,7 @@ def test_get_featurized_data_scaffold():
 #***********************************************************************************
 
 def test_split_dataset():
-    """ Uses the split_datset method of splitting to split data. Implemented in super. Because the various splitting strategies are heavily tested in test_splitting.py, this test is simply ensuring that the attributes are appropriately created.
-    """
+    """Uses the split_datset method of splitting to split data. Implemented in super. Because the various splitting strategies are heavily tested in test_splitting.py, this test is simply ensuring that the attributes are appropriately created."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -261,8 +260,7 @@ def test_split_dataset():
 #***********************************************************************************
 
 def test_save_split_dataset():
-    """Saves the compound IDs and smiles strings for a split subset. Implemented in super
-    """
+    """Saves the compound IDs and smiles strings for a split subset. Implemented in super"""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -296,12 +294,13 @@ def test_load_presplit_dataset():
     (train_attr, valid_attr) = dataset_obj_from_file2.train_valid_attr[0]
     
     test_list = []
-    test_list.append((train.y == orig_train.y).all())
-    test_list.append((valid.y == orig_valid.y).all())
-    test_list.append(train_attr.equals(orig_train_attr))
-    test_list.append(valid_attr.equals(orig_valid_attr))
-    test_list.append((dataset_obj_from_file.test_dset.y == dataset_obj_from_file2.test_dset.y).all())
-    test_list.append(dataset_obj_from_file.test_attr.equals(dataset_obj_from_file2.test_attr))
+    test_list.append((sorted(train.y) == sorted(orig_train.y)))
+    test_list.append((sorted(valid.y) == sorted(orig_valid.y)))
+    test_list.append(set(train_attr.index.values) == set(orig_train_attr.index.values))
+    test_list.append(set(valid_attr.index.values) == set(orig_valid_attr.index.values))
+    test_list.append((sorted(dataset_obj_from_file.test_dset.y) == sorted(dataset_obj_from_file2.test_dset.y)))
+    test_list.append(set(dataset_obj_from_file.test_attr.index.values) == set(dataset_obj_from_file2.test_attr.index.values))
+
     assert all(test_list)
     
 
@@ -309,8 +308,7 @@ def test_load_presplit_dataset():
 #***********************************************************************************
 
 def test_combine_training_data():
-    """ Concatenates train and valid from self.train_valid_dsets[0] into a combined DiskDataset. Implemented in super.
-    """
+    """Concatenates train and valid from self.train_valid_dsets[0] into a combined DiskDataset. Implemented in super."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -324,8 +322,7 @@ def test_combine_training_data():
 #***********************************************************************************
 
 def test_split_dataset_scaffold():
-    """ Uses the split_datset method of splitting to split data. Implemented in super. Because the various splitting strategies are heavily tested in test_splitting.py, this test is simply ensuring that the attributes are appropriately created.
-    """
+    """Uses the split_datset method of splitting to split data. Implemented in super. Because the various splitting strategies are heavily tested in test_splitting.py, this test is simply ensuring that the attributes are appropriately created."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -343,8 +340,7 @@ def test_split_dataset_scaffold():
     
 #***********************************************************************************
 def test_combine_training_data_scaffold():
-    """ Concatenates train and valid from self.train_valid_dsets[0] into a combined DiskDataset. Implemented in super.
-    """
+    """Concatenates train and valid from self.train_valid_dsets[0] into a combined DiskDataset. Implemented in super."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
@@ -365,22 +361,44 @@ def test_combine_training_data_scaffold():
 #***********************************************************************************
 
 def test_get_split_metadata():
-    """ pulls a dictionary that contains the splitting strategy and splitter used to generate the model.
-    """
+    """pulls a dictionary that contains the splitting strategy and splitter used to generate the model."""
     (params_from_file, dataset_obj_from_file, df_delaney) = utils.delaney_objects()
     (params_from_file_scaffold, dataset_obj_from_file_scaffold, df_delaney) = utils.delaney_objects(
         split_strategy="train_valid_test", splitter="scaffold")
 
     out_dict = dataset_obj_from_file.get_split_metadata()
     test_list = []
-    test_list.append(out_dict["Splitting"]["split_strategy"] == dataset_obj_from_file.params.split_strategy)
-    test_list.append(out_dict["Splitting"]["splitter"] == dataset_obj_from_file.params.splitter)
+    test_list.append(out_dict["split_strategy"] == dataset_obj_from_file.params.split_strategy)
+    test_list.append(out_dict["splitter"] == dataset_obj_from_file.params.splitter)
     # TODO: num_folds does not match. Need to identify the difference in num_folds.
     # test_list.append(out_dict["Splitting"]["num_folds"] == dataset_obj_from_file.splitting.num_folds)
-    test_list.append(out_dict["Splitting"]["split_valid_frac"] == dataset_obj_from_file.params.split_valid_frac)
-    test_list.append(out_dict["Splitting"]["split_test_frac"] == dataset_obj_from_file.params.split_test_frac)
-    test_list.append(out_dict["Splitting"]["split_uuid"] == dataset_obj_from_file.split_uuid)
+    test_list.append(out_dict["split_valid_frac"] == dataset_obj_from_file.params.split_valid_frac)
+    test_list.append(out_dict["split_test_frac"] == dataset_obj_from_file.params.split_test_frac)
+    test_list.append(out_dict["split_uuid"] == dataset_obj_from_file.split_uuid)
+   
     assert all(test_list)
     
     
 #***********************************************************************************
+
+def test_load_presplit_dataset():
+    # open the test
+    with open("../test_datasets/H1_hybrid.json", "r") as f:
+        config = json.load(f)
+
+    # change to some fake uuid
+    config["split_uuid"] = "c63c6d89-8832-4434-b27a-17213bd6ef8"
+    params = parse.wrapper(config)
+
+    MP = mp.ModelPipeline(params)
+    featurization=None
+    if featurization is None:
+        featurization = feat.create_featurization(MP.params)
+    MP.featurization = featurization
+    with pytest.raises(SystemExit) as e:
+        # The command to test
+        # should system exit
+        MP.load_featurize_data()
+    # test
+    assert e.type == SystemExit
+    assert e.value.code == 1

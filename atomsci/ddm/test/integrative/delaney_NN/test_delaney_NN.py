@@ -16,9 +16,7 @@ import integrative_utilities
 
 
 def clean():
-    """
-    Clean test files
-    """
+    """Clean test files"""
     for f in ['delaney-processed_curated.csv',
               'delaney-processed_curated_fit.csv',
               'delaney-processed_curated_external.csv',
@@ -28,9 +26,7 @@ def clean():
 
 
 def curate():
-    """
-    Curate dataset for model fitting
-    """
+    """Curate dataset for model fitting"""
     if (not os.path.isfile('delaney-processed_curated.csv') and
         not os.path.isfile('delaney-processed_curated_fit.csv') and
         not os.path.isfile('delaney-processed_curated_external.csv')):
@@ -56,12 +52,12 @@ def curate():
             column, tolerance, list_bad_duplicates, data, max_std, compound_id='compound_id', smiles_col='rdkit_smiles')
 
         # Check distribution of response values
-        assert (curated_df.shape[0] == 1117), 'Error: Incorrect number of compounds'
+        assert (curated_df.shape[0] == 1116), f"Error: Incorrect number of compounds ({len(curated_df)}, should be 1116)"
 
         curated_df.to_csv('delaney-processed_curated.csv')
 
         # Create second test set by reproducible index for prediction
-        curated_df.tail(1000).to_csv('delaney-processed_curated_fit.csv')
+        curated_df.tail(999).to_csv('delaney-processed_curated_fit.csv')
         curated_df.head(117).to_csv('delaney-processed_curated_external.csv')
 
     assert(os.path.isfile('delaney-processed_curated.csv'))
@@ -70,20 +66,16 @@ def curate():
 
 
 def download():
-    """
-    Separate download function so that download can be run separately if there is no internet.
-    """
+    """Separate download function so that download can be run separately if there is no internet."""
     if (not os.path.isfile('delaney-processed.csv')):
         integrative_utilities.download_save(
-            'http://deepchem.io.s3-website-us-west-1.amazonaws.com/datasets/delaney-processed.csv', 'delaney-processed.csv')
+            'https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/delaney-processed.csv', 'delaney-processed.csv')
 
     assert(os.path.isfile('delaney-processed.csv'))
 
 
 def test():
-    """
-    Test full model pipeline: Curate data, fit model, and predict property for new compounds
-    """
+    """Test full model pipeline: Curate data, fit model, and predict property for new compounds"""
 
     # Clean
     # -----
