@@ -27,7 +27,7 @@ xgboost
 bokeh
 matplotlib
 matplotlib-venn
-seaborn
+seaborn>=0.13.0
 umap-learn
 
 pyarrow
@@ -47,5 +47,6 @@ pytest
 ipykernel
 
 deepchem==2.7.1
+rdkit==2023.3.3
 
 pyyaml==5.4.1
